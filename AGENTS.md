@@ -10,7 +10,7 @@
 - 导出模板：**只装了网页平台**（`%APPDATA%\Godot\export_templates\4.7.2.stable\`）。
   想导出 Windows 版得另外补 `windows_release_x86_64.exe` 等文件。
 
-## 四条硬约束（不知道会白干半天）
+## 五条硬约束（不知道会白干半天）
 
 1. **渲染器必须是 Compatibility（WebGL 2）。** Godot 4 的网页版不支持 Forward+/Mobile，
    编辑器里看到的画面就是上限，不要往更高画质调。
@@ -24,6 +24,11 @@
    `objects.githubusercontent.com` 通）。编辑器里「管理导出模板」的自动下载必然失败。
    抓 GitHub release 文件走 `api.github.com/repos/<owner>/<repo>/releases/assets/<id>`
    加 `Accept: application/octet-stream`，让 curl 跟着 302 去 CDN。
+
+5. **联机只能走 `tools/serve.mjs` 的中继。** 浏览器不能监听端口（Godot 网页版也不能），
+   ENet（UDP）在网页版不可用，所以「一方开房间、另一方连过去」这个结构不成立。
+   中继与网页**共用端口**（`ws://…:8000/ws`、`wss://…:8001/ws`）和同一张自签证书。
+   另外：Godot 高层联机 API 需要服务端先发一个 4 字节编号才肯进入已连接状态（详见 README 的「联机」）。
 
 ## 日常命令
 
@@ -45,6 +50,13 @@
 
 ```powershell
 node tools/serve.mjs
+```
+
+联机自测（中继单测；探针需要服务已在运行）：
+
+```powershell
+node tools/relay-selftest.mjs
+node tools/net-probe-check.mjs https://127.0.0.1:8001
 ```
 
 ## 验证手段
@@ -84,6 +96,15 @@ CDP 测试的两个坑：
   验证后发现纯属多余，已删）。
 - **这台机器的 PowerShell 5.1 按 ANSI 读 `.ps1`**，带中文的脚本必须存成 UTF-8 **带 BOM**，
   否则直接语法崩溃。
+- **Godot 的 WebSocket 客户端要求第一个包是 4 字节编号**：内容是小端 int32 的自身编号且 ≥ 2，
+  否则主动断开并报 `Invalid ID received from server`。另外它把收到的每个包都标记为来自 1 号，
+  发送方身份因此无法获知，影响 `rpc_id` 定向与 `MultiplayerSynchronizer` 的 peer 可见性。
+- **`WebSocketMultiplayerPeer` 的握手超时只有 3 秒，且从创建客户端就开始计时。**
+  首帧渲染超过 3 秒（软件渲染、冷启动）时，第一次 `poll()` 已超时 → 判定失败并放弃连接。
+  此时 `poll()` 会因已断开而**永远直接返回**，底层 socket 却还是 `OPEN`、关闭码 `-1`、没有报错；
+  `_clear()` 也不关闭 socket、不重置超时。`scripts/net.gd` 因此设为 20 秒。
+- **导出预设是 `all_resources`，会把 `certs/lan.key` 打进 `index.pck`**，随页面发给局域网内任何人；
+  `build/` 里的 `.import` 也会被扫描。需要加 `exclude_filter`，或在 `build/` 放一个 `.gdignore`。
 
 ## 人机分工
 
@@ -104,11 +125,15 @@ AI 做不了：**判断好不好看**（看不到画面）、**判断手感**（
 - 第三人称角色（`scripts/player.gd`）：镜头相对移动、鼠标视角、重力跳跃、SpringArm 镜头避障
 - 网页导出 → 局域网 HTTPS 服务 → 浏览器里真实渲染出场景，整条链路验证通过
 - 全屏与鼠标锁定：左键点击画面 = 全屏 + 接管鼠标；Esc = 释放鼠标 + 退全屏
+- 联机传输：`tools/ws-relay.mjs`（零依赖中继，16 项单测）+ 两个无头浏览器实测；
+  裸 `WebSocketPeer` 与 Godot 高层 `rpc()` 都双向可用（见 README「联机」）
+- 基础联机同步：`scripts/net.gd` 各客户端以 20 Hz 广播位置与朝向，为其他玩家画替身
+  （两个无头客户端已互相看见）
 
 未完成（下一步按此顺序）：
 
 - [ ] 射击：枪口、子弹、命中判定、掉血
-- [ ] 局域网联机同步（目前**没有任何网络代码**）
+- [ ] 联机同步的完整化：替身碰撞、插值补偿、断线重连
 - [ ] 计分、复活、胜负
 
 注：`dash`（Shift）目前只注册了按键，没有实现行为。

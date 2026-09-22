@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * 局域网静态服务：把 build/ 里的网页版发给同一网络下的另一台设备。
+ * 局域网静态服务 + WebSocket 中继：把 build/ 里的网页版发给同一网络下的另一台设备，
+ * 并让两台设备通过同一端口互发消息。
  *
  *   node tools/serve.mjs            # 服务 build/，HTTP 8000 + HTTPS 8001
  *   node tools/serve.mjs dist 9000  # 指定目录和端口
@@ -14,6 +15,10 @@
  *      所以必须同时开 HTTPS。自签证书会让浏览器报"不受信任"，
  *      点「高级 → 继续前往」之后 isSecureContext 就成立，游戏正常跑。
  *
+ * WebSocket 中继在 /ws（见 ws-relay.mjs）。它和网页共用同一个端口，原因是：
+ * https 页面里只能连 wss，而自签证书的"继续前往"授权是按 host:port 记的，
+ * 共用端口就不用再处理第二张证书。
+ *
  * 网页版用的是单线程模板（variant/thread_support=false），
  * 所以不需要 COOP/COEP 跨域隔离响应头。
  */
@@ -25,6 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import zlib from "node:zlib";
+import { attachWebSocketRelay } from "./ws-relay.mjs";
 
 const root = path.resolve(process.argv[2] ?? path.join(process.cwd(), "build"));
 const port = Number(process.argv[3] ?? process.env.PORT ?? 8000);
@@ -199,22 +205,34 @@ console.log("");
 console.log("  ⚠ Godot 网页版要求 Secure Context：明文 HTTP 只有本机能用，");
 console.log("    另一台设备必须走 HTTPS 那个地址。");
 
-http.createServer(handler).on("error", onError).listen(port, "0.0.0.0", () => {
+const httpServer = http.createServer(handler);
+const httpsServer = hasTls
+  ? https.createServer({ key: fs.readFileSync(keyFile), cert: fs.readFileSync(crtFile) }, handler)
+  : null;
+
+// 中继挂在两个服务上：本机可以走 http/ws（localhost 也算安全上下文），
+// 另一台设备只能走 https/wss。
+attachWebSocketRelay(
+  httpsServer ? [httpServer, httpsServer] : [httpServer],
+  { log: (msg) => console.log(msg) }
+);
+
+httpServer.on("error", onError).listen(port, "0.0.0.0", () => {
   banner("http", port, "(仅本机可用)");
 });
 
-if (hasTls) {
-  const tlsOptions = { key: fs.readFileSync(keyFile), cert: fs.readFileSync(crtFile) };
-  https.createServer(tlsOptions, handler).on("error", onError)
-    .listen(port + 1, "0.0.0.0", () => {
-      banner("https", port + 1, "(另一台设备用这个)");
-      console.log("");
-      console.log("  浏览器提示证书不受信任 → 点「高级」→「继续前往」，之后正常玩。");
-      console.log("  证书已按当前 IP 签好，有效期 10 年。");
-      console.log("");
-      console.log("  Ctrl+C 停止。");
-      console.log("");
-    });
+if (httpsServer) {
+  httpsServer.on("error", onError).listen(port + 1, "0.0.0.0", () => {
+    banner("https", port + 1, "(另一台设备用这个)");
+    console.log("");
+    console.log("  浏览器提示证书不受信任 → 点「高级」→「继续前往」，之后正常玩。");
+    console.log("  证书已按当前 IP 签好，有效期 10 年。");
+    console.log("");
+    console.log(`  WebSocket 中继: ws://<地址>:${port}/ws 与 wss://<地址>:${port + 1}/ws`);
+    console.log("");
+    console.log("  Ctrl+C 停止。");
+    console.log("");
+  });
 } else {
   console.log("");
   console.log("  ⚠ HTTPS 未启动，另一台设备将无法运行（Secure Context 不满足）。");

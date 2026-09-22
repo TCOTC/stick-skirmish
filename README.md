@@ -18,8 +18,10 @@
 - [x] 对称竞技场（地板 + 掩体 + 边界，由 `scripts/arena.gd` 数据生成）
 - [x] 第三人称角色：镜头相对移动、鼠标视角、重力跳跃、SpringArm 镜头避障
 - [x] 网页版链路跑通：导出 → 局域网服务 → 浏览器里真的渲染出场景
+- [x] 联机传输链路验证：中继双向收发、Godot 高层 API 的广播 `rpc`（见下文「联机」）
+- [x] 基础联机同步：各自广播位置与朝向，为其他玩家画替身（能看见对方在动）
 - [ ] 射击与命中判定
-- [ ] 局域网联机同步
+- [ ] 联机同步的完整化：替身碰撞、插值补偿、断线重连
 - [ ] 计分、复活、胜负
 
 ## 跑起来
@@ -73,6 +75,88 @@ $env:MSYS_NO_PATHCONV = '1'
   -keyout 'certs/lan.key' -out 'certs/lan.crt' -subj '/CN=Stick Skirmish LAN' `
   -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:<你的局域网IP>'
 ```
+
+## 联机
+
+两台设备之间**没有「一方开房间、另一方连过去」这个选项**：浏览器不能监听端口，
+Godot 网页版同样不能，而 ENet（UDP）在网页版不可用。所以 `tools/serve.mjs` 兼任中继，
+两个浏览器都作为客户端连上来，中继把消息转给同房间的其他连接。
+
+中继与网页**共用同一个端口**（`ws://…:8000/ws` 与 `wss://…:8001/ws`），
+目的是让自签证书只处理一次。
+
+### 两台设备怎么玩
+
+1. 一台跑 `node tools/serve.mjs`
+2. **这台机器**打开 `http://localhost:8000/`（`localhost` 也算安全上下文，没有证书提示）
+3. **另一台**打开 `https://<本机局域网IP>:8001/`（会提示证书，点「高级」→「继续前往」）
+4. 两台都**左键点一下画面**（全屏 + 接管鼠标），就能看见对方的胶囊了
+
+两边网址不带参数就都进 `game` 房间。要分开测试时用 `?room=xxx`，**房间名必须一致**。
+画面左上角会显示 `room=game  me=<编号>  connected  others=[<编号>]`。
+
+同步由 `scripts/net.gd` 负责：每个客户端以 20 Hz 广播自己的位置与朝向，
+替身做位置平滑。当前只同步位置与朝向——替身没有碰撞、没有射击、没有血量。
+
+### 踩过的坑：握手超时只有 3 秒
+
+`WebSocketMultiplayerPeer` 的 `handshake_timeout` 默认 **3 秒**，而且它**从创建客户端的那一刻就开始计时**，
+不是从连接建立开始。如果首帧渲染耗时超过 3 秒（软件渲染、低端设备、冷启动都会），
+第一次 `poll()` 时超时已过，Godot 就判定握手失败并放弃连接：
+
+- `poll()` 一旦看到 `CONNECTION_DISCONNECTED` 就**直接返回**（`websocket_multiplayer_peer.cpp` 的 `poll()`），
+  所以即使底层 WebSocket 随后真的进入了 `OPEN`，也不会有任何东西再去读它
+- `_clear()` 只把 `peers_map` 置空、**不关闭底层 socket**，也不重置 `handshake_timeout`
+- 症状：连上后立刻“断开”，`get_connection_status()` 是 `disconnected`，
+  而内层 `WebSocketPeer` 却是 `OPEN`、关闭码为 `-1`，没有任何错误信息
+
+`net.gd` 因此把 `handshake_timeout` 设为 **20 秒**。
+
+### 中继约定
+
+| 项目 | 约定 |
+| --- | --- |
+| 房间 | 由路径决定：`/ws` 是默认房间，`/ws/<名字>` 是独立房间，房间之间不转发 |
+| 编号 | 全局递增，从 1 开始。哪个是房主由游戏按编号判断，中继不参与 |
+| 控制消息 | 文本帧，以 `relay:` 开头，**只在客户端请求之后才发出** |
+| 游戏数据 | 一律用二进制帧，原样转发 |
+| `?as=godot` | 该连接可以运行 Godot 的 `WebSocketMultiplayerPeer` |
+
+请求房间信息：发出 `relay:whoami`，得到 `relay:hello id=<编号> room=<房间> peers=<人数> ids=<全部编号>`。
+需要离开通知：发出 `relay:subscribe`，之后同房间有人离开会收到 `relay:peer-left …`。
+
+### 高层联机 API 的实测结论
+
+`?as=godot` 让中继在握手之后先发出一个 4 字节小端 int32（自身编号，且 ≥ 2）。
+Godot 的客户端要求第一个包就是这个内容，否则主动断开并报 `Invalid ID received from server`
+（见 `modules/websocket/websocket_multiplayer_peer.cpp` 的 `_poll_client`）。
+
+启用之后 `MultiplayerAPI` 能进入已连接状态，**广播式 `rpc()` 双向可用**（实测无重复、无丢失）。
+但是 Godot 把收到的每个包都标记为「来自 1 号」，也就是发送方身份无法获知。因此：
+
+- `rpc()`（广播）可用；需要区分发送者时，把自身编号写在参数里
+- `rpc_id()` 定向到某个玩家不可用
+- 按 peer 的可见性（`MultiplayerSynchronizer`）不可用，状态同步需要自己写
+
+### 验证
+
+```powershell
+node tools/relay-selftest.mjs                         # 中继单测，16 项
+node tools/net-probe-check.mjs https://127.0.0.1:8001 # 传输层探针（两个无头 Chrome）
+node tools/net-probe-check.mjs https://127.0.0.1:8001 --room  # 两个客户端能否看见对方
+```
+
+探针在 `scripts/net_probe.gd`（autoload `NetProbe`），只有网址带 `?probe=1` 时才启用，
+结果同时打印到控制台并写入 `window.__netprobe`。
+
+手动验证（两台设备）：这台打开 `https://<本机IP>:8001/index.html?probe=1&name=host`，
+另一台打开 `https://<本机IP>:8001/index.html?probe=1&name=guest`，两边控制台都会输出 `[netprobe] …`。
+
+### 本次验证没有覆盖的部分
+
+- 无头 Chrome 用 `--ignore-certificate-errors` 绕过了证书提示，因此**真实浏览器里点过
+  「继续前往」之后 `wss://<IP>:8001` 是否同样被授权还没有实测**（那个提示无法自动点击）
+- 两台真实设备之间的延迟与丢包没有测，全部数据来自同一台机器的 `127.0.0.1`
 
 ## 全屏与鼠标锁定
 

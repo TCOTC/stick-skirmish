@@ -13,6 +13,15 @@ run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
 config/icon="res://icon.svg"
 
+[autoload]
+
+; 联机：每个客户端广播自己的位置，并为其他玩家画替身（见 scripts/net.gd）。
+Net="*res://scripts/net.gd"
+
+; 临时：联机连通性探针，只有网址带 ?probe=1 时才做事。
+; 验证完联机方案后连同 scripts/net_probe.gd 一起删。
+NetProbe="*res://scripts/net_probe.gd"
+
 [display]
 
 window/size/viewport_width=1280
