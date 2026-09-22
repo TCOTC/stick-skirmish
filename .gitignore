@@ -1,0 +1,14 @@
+# Godot 4
+.godot/
+
+# 导出产物。保留 .gitkeep 占位，否则新克隆出来没有 build/ 目录，
+# Godot 导出会直接报「目标文件夹不存在」。
+build/*
+!build/.gitkeep
+
+# 系统
+Thumbs.db
+desktop.ini
+
+# 自签证书的私钥，不要提交
+certs/

@@ -1,0 +1,30 @@
+; Engine configuration file.
+; Stick Skirmish —— 双人局域网 3D 第三人称射击
+;
+; 注意：网页版只能用 Compatibility 渲染器（WebGL 2）。
+; Forward+ / Mobile 在 web 平台不支持，所以这里从一开始就锁死 gl_compatibility。
+
+config_version=5
+
+[application]
+
+config/name="Stick Skirmish"
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("4.7", "GL Compatibility")
+config/icon="res://icon.svg"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+
+[physics]
+
+3d/default_gravity=24.0
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+anti_aliasing/quality/msaa_3d=1

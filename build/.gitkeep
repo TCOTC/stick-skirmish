@@ -1,0 +1,2 @@
+# 导出产物目录。Godot 不会自动创建它，所以要留个占位文件。
+# 实际产物（index.html / .wasm / .pck 等）已被 .gitignore 忽略。
