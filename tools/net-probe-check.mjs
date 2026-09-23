@@ -416,6 +416,31 @@ async function fireBurst(cdp, samples, opts = {}) {
   };
 }
 
+/**
+ * 一下一下地点射，逐发取“这一发让准星偏了多少”。
+ *
+ * 水平后坐力是随机的，无法用“总共偏了多少”来断言它是否随机，
+ * 所以要一发一取样。间隔要大于射速冷却（0.11 秒），否则一次点击会打出多发、样本就混了。
+ */
+async function fireTaps(cdp, count) {
+  const samples = [];
+  for (let i = 0; i < count; i++) {
+    const before = await readStat(cdp);
+    await cdpFire(cdp, true);
+    await sleep(45);
+    await cdpFire(cdp, false);
+    await sleep(220);
+    const after = await readStat(cdp);
+    if (!before || !after) continue;
+    samples.push({
+      shots: after.shots - before.shots,
+      yaw: angleDiff(after.figure.bodyYawDeg, before.figure.bodyYawDeg),
+      pitch: after.pitchDeg - before.pitchDeg,
+    });
+  }
+  return samples;
+}
+
 /** 按下或松开鼠标左键。
  *
  * 命中判定走的就是真实输入，所以截图之类的地方也必须用同一套事件，
@@ -839,6 +864,17 @@ async function checkShoot() {
   }, 4000, 200);
   const standAfter = await readStat(a.cdp);
 
+  // 水平后坐力：逐发取样，验证“存在、有界、每发不同”。
+  // 这一段里不能碰鼠标，否则分不清 yaw 的变化是后坐力还是鼠标造成的。
+  const recoilYaw = (await readStat(a.cdp))?.recoilYawDeg ?? 0;
+  const taps = (await fireTaps(a.cdp, 8)).filter((t) => t.shots === 1);
+  const yawDeltas = taps.map((t) => t.yaw);
+  const yawAbsMax = yawDeltas.length ? Math.max(...yawDeltas.map(Math.abs)) : 0;
+  const yawSpread = yawDeltas.length
+    ? Math.max(...yawDeltas) - Math.min(...yawDeltas)
+    : 0;
+  const anyYaw = yawAbsMax > 0.05;
+
   // 等 beta 血量恢复（后台标签页会被节流，给足时间）。
   // 注意：掉血本身是在开火期间盯出来的（见 fireBurst 的 watch），
   // 不能这时候再读——他被打死重生后就又是满血了。
@@ -888,6 +924,12 @@ async function checkShoot() {
       `站立抬 ${standBurst.pitchClimb.toFixed(1)}° / 下蹲抬 ${crouchBurst.pitchClimb.toFixed(1)}°`],
     ["松开 Shift 后能站起来", standAfter !== null && standAfter.crouch < 0.05,
       `下蹲程度 ${(standAfter?.crouch ?? -1).toFixed(2)}，相机回到 ${(standAfter?.camY ?? 0).toFixed(2)} 米`],
+    ["开火会让准星左右偏", anyYaw,
+      `${yawDeltas.length} 发里最大偏移 ${yawAbsMax.toFixed(2)}°`],
+    ["每发的左右偏移不超出设定范围", yawAbsMax <= recoilYaw + 0.25,
+      `最大 ${yawAbsMax.toFixed(2)}°（上限 ${recoilYaw}°，配置值；另留 0.25° 供快照取整）`],
+    ["左右偏移是随机的（每发不一样）", yawSpread > 0.1,
+      `极差 ${yawSpread.toFixed(2)}°（逐发：${yawDeltas.map((d) => d.toFixed(1)).join(", ")}）`],
     ["被打的人扣了血", betaHealth < 100, `beta 最低血量 ${betaHealth}`],
     ["血量归零后重生回满血", betaHealth > 0 || revived !== null,
       betaHealth > 0 ? `未打死（剩 ${betaHealth}）` : `重生后 ${revived?.health ?? "未恢复"}`],

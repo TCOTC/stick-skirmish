@@ -39,6 +39,11 @@ extends CharacterBody3D
 ## 后坐力是**累积上飘且不回落**的：连发时准星逐渐往上飘，松开后**停在抬起的位置**，
 ## 要靠自己把鼠标往下压来补偿。这比“抬一下再弹回去”更吃操作，也让压枪成为一门手艺。
 @export var recoil_per_shot_deg: float = 1.4
+## 每发的**水平随机偏移上限**（度）。左右各取 [-此值, +此值] 内的随机值。
+##
+## 它是随机的（每一发都不一样），而且和俯仰一样累积、不回落，所以连发时准星会左右乱蹿，
+## 越持续扫射越难控制。水平方向**没有上限**：yaw 会绕圈，硬设一个限制反而奇怪。
+@export var recoil_yaw_deg: float = 0.6
 
 ## 站立时相机相对角色的高度（米）。下蹲时会降到 crouch_cam_y。
 ##
@@ -228,16 +233,19 @@ func crouch_amount() -> float:
 	return _crouch
 
 
-## 开一发的后坐力：把准星往上抬一点，**并且留在那里**。
+## 开一发的后坐力：把准星往上抬一点、并左右随机偏一点，**而且都留在那里**。
 ##
 ## 唯一的边界是俯仰上限（pitch_max_deg）：一直按住不放会飘到顶，此时无法再往上。
-## 不再有“累积上限 + 自行回落”那一套，因为需求是“飘上去不要回原位”。
+## 水平方向没有限制（yaw 会绕圈）。不再有“累积上限 + 自行回落”那一套，
+## 因为需求是“飘上去不要回原位”。
 func _kick_recoil() -> void:
 	var scale := lerpf(1.0, crouch_recoil_scale, _crouch)
-	var kick := deg_to_rad(recoil_per_shot_deg * scale)
 	_pitch = clampf(
-		_pitch + kick, deg_to_rad(pitch_min_deg), deg_to_rad(pitch_max_deg)
+		_pitch + deg_to_rad(recoil_per_shot_deg * scale),
+		deg_to_rad(pitch_min_deg), deg_to_rad(pitch_max_deg)
 	)
+	# 左右随机：每发独立取值，所以连发轨迹不是一条直线而是会左右乱蹿。
+	rotation.y += deg_to_rad(randf_range(-recoil_yaw_deg, recoil_yaw_deg) * scale)
 
 
 ## 身体随方向键偏转一点，**不超过 lean_deg**。镜头不跟随这个偏转。

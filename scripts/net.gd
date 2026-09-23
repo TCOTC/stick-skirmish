@@ -457,6 +457,7 @@ func _publish() -> void:
 	var recoil_per_shot_deg := 0.0
 	var pitch_max_deg := 0.0
 	var crouch_recoil_scale := 1.0
+	var recoil_yaw_deg := 0.0
 	if _player != null:
 		if _player.has_method("crouch_amount"):
 			crouch = float(_player.call("crouch_amount"))
@@ -468,6 +469,7 @@ func _publish() -> void:
 		recoil_per_shot_deg = float(_player.get("recoil_per_shot_deg"))
 		pitch_max_deg = float(_player.get("pitch_max_deg"))
 		crouch_recoil_scale = float(_player.get("crouch_recoil_scale"))
+		recoil_yaw_deg = float(_player.get("recoil_yaw_deg"))
 		crouch = snappedf(crouch, 0.01)
 		pitch_deg = snappedf(pitch_deg, 0.01)
 		cam_y = snappedf(cam_y, 0.01)
@@ -506,6 +508,7 @@ func _publish() -> void:
 		"pitchDeg": pitch_deg,
 		"camY": cam_y,
 		"recoilPerShotDeg": recoil_per_shot_deg,
+		"recoilYawDeg": recoil_yaw_deg,
 		"pitchMaxDeg": pitch_max_deg,
 		"crouchRecoilScale": crouch_recoil_scale,
 		"fx": _count_fx(),
