@@ -1,8 +1,9 @@
 extends CanvasLayer
-## HUD：血量条、受伤红闪、命中提示、倒地提示、比分板、胜负横幅、击杀提示。
+## HUD：准星、血量条、受伤红闪、命中提示、倒地提示、比分板、胜负横幅、击杀提示。
 ##
-## 控件全部用代码建（`main.tscn` 里只留已有的准星），因为准星的位置与尺寸是场景数据、
-## 而血量条这类会随状态变化的东西，写在代码里比在 .tscn 里改偏移量清楚。
+## 控件全部用代码建（`main.tscn` 里只有一层空的 CanvasLayer），因为位置与尺寸会随状态变化，
+## 写在代码里比在 .tscn 里改偏移量清楚。准星也在这里——它的五个部件尺寸必须一起看，
+## 分成两处（中心在场景、刻度在代码）就会像之前那样，只把中心改小了却发现两边对不上。
 ##
 ## 文字一律用英文或数字：Godot 默认字体不含中日韩字形，中文会显示成空白方块。
 ##
@@ -21,8 +22,12 @@ const FEED_MAX := 4
 ## 受伤红闪的淡出时长（秒）。
 const FLASH_TIME := 0.35
 
-## 准星刻度：四根短线，间距跟着当前散布张开。散布大时口子大。
-## 这是玩家唯一能“看见”散布的地方——否则散布只是个看不见的数值。
+## 准星：中心一个点，四周四根短线，间距跟着当前散布张开。
+##
+## 【为什么中心这么小】它曾经是 6×6 的实心方块（写在 main.tscn 里），实测挡视野：
+## 屏幕正中恰好是看对手的位置，方块一大就把目标盖住。缩到 3×3 的小点，
+## 既能指出中心，又不遮住东西。四根短线只是**散布的指示器**，不参与瞄准。
+const CROSS_CENTER := 3.0
 const CROSS_BASE_GAP := 4.0
 const CROSS_GAP_PER_DEG := 3.2
 const CROSS_LEN := 6.0
@@ -53,8 +58,9 @@ var _flash_tween: Tween = null
 var _hint_box: VBoxContainer = null
 var _hint_main: Label = null
 var _hint_sub: Label = null
-## 准星的四根刻度（上、下、左、右），以及当前间距（用来避免重复布局）。
+## 准星的四根刻度（上、下、左、右）、中心点，以及当前间距（用来避免重复布局）。
 var _cross: Array[ColorRect] = []
+var _cross_center: ColorRect = null
 var _cross_gap := -1.0
 
 # 命中提示出现过几次（含击杀）。供自动化检查确认提示真的触发过。
@@ -236,6 +242,12 @@ func _tick_feed(delta: float) -> void:
 ## 准星间距（像素）。散布变化时自动化检查靠它确认“准星真的跟着张开了”。
 func crosshair_gap() -> float:
 	return snappedf(_cross_gap, 0.1)
+
+
+## 准星中心点的边长（像素）。它是被点名过的问题（曾经是 6×6 的实心方块、挡视野），
+## 所以报出来让自动化检查守着，而不是只靠人工看截图。
+func crosshair_center_size() -> float:
+	return CROSS_CENTER
 
 ## 比分板的文字（按行用 " | " 连接）。检查“界面真的显示了比分”要靠它，
 ## 只读 Match 里的数字不够——数字对、界面没画出来也是一样的。
@@ -421,18 +433,16 @@ func _build_flash() -> void:
 	add_child(_flash)
 
 
-## 准星刻度。中心那个方块在 main.tscn 里，这里只加四根会动的短线。
+## 准星：中心一个点 + 四根会动的短线。
 func _build_crosshair() -> void:
+	_cross_center = _center_rect("CrossCenter")
+	_cross_center.offset_left = -CROSS_CENTER * 0.5
+	_cross_center.offset_top = -CROSS_CENTER * 0.5
+	_cross_center.offset_right = CROSS_CENTER * 0.5
+	_cross_center.offset_bottom = CROSS_CENTER * 0.5
+
 	for i in 4:
-		var rect := ColorRect.new()
-		rect.name = "Cross%d" % i
-		rect.anchor_left = 0.5
-		rect.anchor_top = 0.5
-		rect.anchor_right = 0.5
-		rect.anchor_bottom = 0.5
-		rect.color = CROSS_COLOR
-		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		add_child(rect)
+		var rect := _center_rect("Cross%d" % i)
 		_cross.append(rect)
 		# 0/1 是上下两根（竖向短杆），2/3 是左右两根（横向短杆）
 		if i < 2:
@@ -442,6 +452,21 @@ func _build_crosshair() -> void:
 			rect.offset_top = -CROSS_THICK * 0.5
 			rect.offset_bottom = CROSS_THICK * 0.5
 	set_spread(0.0)
+
+
+## 建一个锚在屏幕正中的矩形。准星的五个部件都是这种，只有偏移量不同。
+func _center_rect(rect_name: String) -> ColorRect:
+	var rect := ColorRect.new()
+	rect.name = rect_name
+	rect.anchor_left = 0.5
+	rect.anchor_top = 0.5
+	rect.anchor_right = 0.5
+	rect.anchor_bottom = 0.5
+	rect.color = CROSS_COLOR
+	# 铺在屏幕正中的控件若参与 GUI 输入，会把点击吞掉（接管鼠标也要靠那一下点击）。
+	rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(rect)
+	return rect
 
 
 ## 散布（度）→ 准星间距。角度越大，口子越开。

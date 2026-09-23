@@ -603,6 +603,7 @@ func _hud_info() -> Dictionary:
 		"down": str(hud.call("down_text")),
 		"hint": str(hud.call("hint_text")),
 		"crosshairGap": float(hud.call("crosshair_gap")),
+		"crosshairCenter": float(hud.call("crosshair_center_size")),
 	}
 
 

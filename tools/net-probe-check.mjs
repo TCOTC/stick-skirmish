@@ -46,7 +46,14 @@ const SHOOT_ROOM = process.env.SHOOT_ROOM ?? "shoottest";
 const SCORE_ROOM = process.env.SCORE_ROOM ?? "scoretest";
 const SHOT_DIR = process.env.NET_SHOT_DIR ?? "";
 // 让第二个实例晚一点再加入，用来复现"一个人先开、另一个人后进"的真实场景。
-const JOIN_DELAY_MS = Number(process.env.TEST_JOIN_DELAY_MS ?? 0);
+//
+// 记分模式**默认就延迟**：它的第一项断言是"单人时提示等待对手、对手到了才喊 ROUND 1"，
+// 而两个实例同时启动时，对手往往在第一次采样之前就已经到场，等待态根本没被看到
+// （实测就是这么假失败过一次）。让 beta 晚 6 秒进来，那段等待窗口才稳定可观察。
+// 顺带这也覆盖了"后加入"这个真实场景。
+const JOIN_DELAY_MS = Number(
+  process.env.TEST_JOIN_DELAY_MS ?? (MODE === "score" ? 6000 : 0),
+);
 
 // 鼠标横移用一个固定的 x 累加，好让 movementX 已知（见 mouseDelta）。
 let mouseX = 300;
@@ -936,6 +943,7 @@ async function checkShoot() {
   const spreadMax = crouchBefore?.spreadMaxDeg ?? 0;
   // 静止时的准星间距（散布在最小值的状态），用来对比“开火时张开了多少”
   const baseGap = ready.sa.hud?.crosshairGap ?? 0;
+  const centerSize = ready.sa.hud?.crosshairCenter ?? 0;
 
   const idA = ready.sa.myId;
   const idB = ready.sb.myId;
@@ -997,6 +1005,10 @@ async function checkShoot() {
       `开火期间同时有 ${standBurst.maxSounds} 个音效在播`],
     ["准星间距跟着散布张开", standBurst.maxGap > baseGap + 1.5,
       `准星间距 ${baseGap} → ${standBurst.maxGap} 像素（散布 ${spreadMin}° → ${standBurst.maxSpread.toFixed(2)}°）`],
+    ["准星中心是小点、不挡视野", centerSize > 0 && centerSize <= 4.0,
+      `中心点 ${centerSize} 像素（曾经是 6 像素的实心方块）`],
+    ["准星中心与刻度分得开（不会并成一块）", baseGap - centerSize / 2 >= 1.0,
+      `间隙 ${(baseGap - centerSize / 2).toFixed(1)} 像素（间距 ${baseGap}、中心半径 ${centerSize / 2}）`],
     ["打中对方后开枪方出现命中提示", (finalA?.hud?.hitmarkers ?? 0) > 0,
       `命中提示 ${finalA?.hud?.hitmarkers ?? 0} 次`],
     ["击倒对方时出现击杀提示", (finalA?.hud?.kills ?? 0) > 0,
