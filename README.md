@@ -276,6 +276,7 @@ node tools/shot.mjs                                              # 整屏 + 画�
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\a.png --stat     # 同时输出游戏状态
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\w.png --key w   # 按住 W 拍走路姿态
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\c.png --pixels 624,278,11,11  # 打印一块像素的灰度
+node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\r.png --dpr 2                 # 模拟 Retina（用户主要在 Mac 上玩）
 ```
 
 `--pixels` 用页面自己解码截图（`createImageBitmap` + `OffscreenCanvas`，不需要图像库）读出
@@ -283,6 +284,9 @@ node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\c.png --pixels 624,278,11,1
 1 像素的点摊成一团渐变，看不出“到底占几个像素”。核对准星中心点、描边宽度这类问题时用它。
 实测（1258x566 视口）准星中心恰好是 1 个像素的全墨（灰度 43），四周刻线各 1 像素宽、
 左右间隙对称。
+
+`--dpr 2` 模拟 Retina：实测引擎会按设备像素渲染再放大，所以 **1 像素的准星在那边是
+2 个设备像素 = 1 个 CSS 像素**，刻线是 3 个设备像素（1.5 CSS 像素）——正是想要的大小。
 
 按住键截图时会先点击画面，而点击会触发**全屏**、视口尺寸随之改变（实测 1258x566 → 800x544），
 写死的裁剪坐标会捕空，所以那种场景要用 `--center 宽,高[,纵向偏移]` 按当前视口中心裁剪。

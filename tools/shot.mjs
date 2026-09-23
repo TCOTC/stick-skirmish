@@ -69,6 +69,9 @@ const QUERY = opt("query", "");
 // 描边宽度这类像素级的量时，要看原始灰度值。
 // 解码交给页面自己（createImageBitmap + OffscreenCanvas），不需要引入图像库。
 const PIXELS = opt("pixels", "");
+// 可选：模拟高 DPI（用户主要在 Retina 的 Mac 上玩，那边 devicePixelRatio 是 2）。
+// 引擎的视口与 HUD 都用**设备像素**，所以 1 像素的准星在那边是 0.5 CSS 像素。
+const DPR = Number(opt("dpr", "0"));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -204,6 +207,15 @@ try {
 
   const url = QUERY ? `${BASE}/index.html?${QUERY}` : `${BASE}/index.html`;
   console.log(`  截图目标: ${url}`);
+  if (DPR > 0) {
+    // 视口尺寸用当前窗口的 CSS 尺寸，只换像素比：模拟 Retina 屏。
+    const w = await cdp.evaluate("innerWidth");
+    const h = await cdp.evaluate("innerHeight");
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: w, height: h, deviceScaleFactor: DPR, mobile: false,
+    });
+    console.log(`  模拟 devicePixelRatio=${DPR}（CSS ${w}x${h} → 设备像素 ${w * DPR}x${h * DPR}）`);
+  }
   await cdp.send("Page.navigate", { url });
 
   // 等到游戏主循环真的跑起来（net.gd 每 0.25 秒写一次这个全局变量）

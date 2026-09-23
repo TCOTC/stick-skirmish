@@ -71,11 +71,13 @@ node tools/shot.mjs                                              # 整屏 + 中�
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\a.png --stat     # 同时输出游戏状态
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\w.png --key w --center 150,230,30   # 按住 W 拍走路姿态
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\c.png --pixels 624,278,11,11       # 打印一块像素的灰度
+node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\r.png --dpr 2                       # 模拟 Retina（Mac 上 dpr=2）
 ```
 
 `--pixels` 用页面自己解码截图读原始灰度（不需要图像库）。**放大截图看不出像素级的量**：
 `Page.captureScreenshot` 的 `scale` 带插值，一个 1 像素的点会被摊成一团渐变。
 核对准星中心点、描边宽度这类问题时用它。
+`--dpr 2` 模拟 Retina：引擎按设备像素渲染再放大，所以 1 像素的准星在那边是 2 个设备像素。
 
 输出路径**不要写进项目目录**（会被 Godot 当资源导出，见下方“已经踩过的坑”）。
 
