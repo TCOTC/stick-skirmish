@@ -369,16 +369,19 @@ function decorOk(state) {
 }
 
 /**
- * 按住左键打一段，返回这段里的俯仰抬升情况。
+ * 按住左键打一段，返回这段里的俯仰变化与对方的最低血量。
  *
- * 后坐力是“真抬准星”，所以开火期间 `pitchDeg` 会上升、松开后回落。
- * 拿它做断言比看截图可靠：抬了多少度是确定的数值。
+ * 后坐力是“真抬准星、而且不回落”，所以开火期间 `pitchDeg` 会一路上升。
+ * 拿它做断言比看截图可靠：飘了多少度是确定的数值。
+ *
+ * `opts.watch` 是另一个实例的 CDP：开火期间**同时**盯它的血量。
+ * 不能等打完了再读——对方被打死会在 3 秒后重生回满血，那时候读到的永远是 100。
  */
-async function fireBurst(cdp, samples, fxSink) {
+async function fireBurst(cdp, samples, opts = {}) {
   const before = await readStat(cdp);
   const pitchBefore = before?.pitchDeg ?? 0;
   let peak = pitchBefore;
-  let peakRecoil = 0;
+  let minHealth = 999;
 
   await cdp.send("Input.dispatchMouseEvent", {
     type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
@@ -386,22 +389,30 @@ async function fireBurst(cdp, samples, fxSink) {
   for (let i = 0; i < samples; i++) {
     const s = await readStat(cdp);
     if (s) {
-      if (fxSink) fxSink.push(s.fx);
+      if (opts.fxSink) opts.fxSink.push(s.fx);
       peak = Math.max(peak, s.pitchDeg ?? 0);
-      peakRecoil = Math.max(peakRecoil, s.recoilDeg ?? 0);
+    }
+    if (opts.watch) {
+      const w = await readStat(opts.watch);
+      if (w) minHealth = Math.min(minHealth, w.health);
     }
     await sleep(60);
   }
   await cdp.send("Input.dispatchMouseEvent", {
     type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
   });
+  // 松手后要等一拍再读：Godot 还没处理完这次松开时，冷却到点就会又打出一发，
+  // 于是“松手瞬间的俯仰”会偏小，被误判成“回落了”。
+  await sleep(500);
 
+  const afterRelease = await readStat(cdp);
   return {
     pitchBefore,
     pitchClimb: peak - pitchBefore,
-    peakRecoil,
+    pitchAfterRelease: afterRelease?.pitchDeg ?? 0,
+    minHealth,
     shotsBefore: before?.shots ?? 0,
-    shotsAfter: (await readStat(cdp))?.shots ?? 0,
+    shotsAfter: afterRelease?.shots ?? 0,
   };
 }
 
@@ -742,7 +753,7 @@ async function checkShoot() {
   const shotsBefore = (await readStat(a.cdp))?.shots ?? 0;
   const fireStart = Date.now();
   const fxSeen = [];
-  const standBurst = await fireBurst(a.cdp, 12, fxSeen);
+  const standBurst = await fireBurst(a.cdp, 12, { fxSink: fxSeen, watch: b.cdp });
   const fireMs = Date.now() - fireStart;
 
   const afterFire = await readStat(a.cdp);
@@ -750,25 +761,29 @@ async function checkShoot() {
   const fxMax = fxSeen.length ? Math.max(...fxSeen) : 0;
   const ratePerSec = shotsDelta / Math.max(0.001, fireMs / 1000);
 
-  // 后坐力应当回落：等一会儿再看，俯仰要回到开火前的水准（鼠标没动过）。
-  const recoilBack = await waitFor(async () => {
-    const s = await readStat(a.cdp);
-    return s && Math.abs(s.pitchDeg - standBurst.pitchBefore) < 0.6 ? s : null;
-  }, 6000, 250);
-  const recovered = recoilBack !== null;
-  const recoilLeft = recoilBack ? Math.abs(recoilBack.pitchDeg - standBurst.pitchBefore) : 999;
+  // 后坐力**不回落**：准星应当停在抬起后的位置，而不是自己滑回开火前的水准
+  // （这段时间里鼠标没动过）。比较基准取**松手那一瞬间**的俯仰，
+  // 而不是采样期间的峰值——松手后到采样结束之间还会再打出几发。
+  await sleep(1500);
+  const afterHold = await readStat(a.cdp);
+  const pitchHeld = afterHold?.pitchDeg ?? 0;
+  const holdDrift = Math.abs(pitchHeld - standBurst.pitchAfterRelease);
+  const climbedTotal = pitchHeld - standBurst.pitchBefore;
+
+  // 再打一轮：既然不回落，第二轮的终点应当比第一轮更高（持续上飘）。
+  const secondBurst = await fireBurst(a.cdp, 8);
 
   // 下蹲：按住 Shift 应当下蹲（相机下降）、并且后坐力明显变小。
   const crouchBefore = await readStat(a.cdp);
   const recoilPerShot = crouchBefore?.recoilPerShotDeg ?? 0;
-  const recoilMax = crouchBefore?.recoilMaxDeg ?? 0;
+  const pitchMax = crouchBefore?.pitchMaxDeg ?? 0;
   await keyDown(a.cdp, "ShiftLeft");
   const crouched = await waitFor(async () => {
     const s = await readStat(a.cdp);
     return s && s.crouch > 0.95 ? s : null;
   }, 4000, 200);
 
-  const crouchBurst = await fireBurst(a.cdp, 8, []);
+  const crouchBurst = await fireBurst(a.cdp, 8);
   await keyUp(a.cdp, "ShiftLeft");
   await waitFor(async () => {
     const s = await readStat(a.cdp);
@@ -776,12 +791,10 @@ async function checkShoot() {
   }, 4000, 200);
   const standAfter = await readStat(a.cdp);
 
-  // 等 beta 身上的扣血（后台标签页会被节流，给足时间）
-  const hurt = await waitFor(async () => {
-    const s = await readStat(b.cdp);
-    return s && s.health < 100 ? s : null;
-  }, 10_000);
-  const betaHealth = hurt?.health ?? (await readStat(b.cdp))?.health ?? -1;
+  // 等 beta 血量恢复（后台标签页会被节流，给足时间）。
+  // 注意：掉血本身是在开火期间盯出来的（见 fireBurst 的 watch），
+  // 不能这时候再读——他被打死重生后就又是满血了。
+  const betaHealth = standBurst.minHealth;
 
   // 血量归零后应当自动重生回满血（重生延迟 3 秒，后台页要给足时间）
   const revived = betaHealth <= 0
@@ -850,13 +863,16 @@ async function checkShoot() {
       `按住 ${fireMs} ms 打出 ${shotsDelta} 发，合 ${ratePerSec.toFixed(1)} 发/秒（配置 9）`],
     ["开火产生了特效（曳光/弹着点）", fxMax > 0, `同时存在的特效最多 ${fxMax} 个`],
     ["特效会自己清掉（不堆积）", fxAfter === 0, `1.2 秒后剩 ${fxAfter} 个`],
-    ["开火时准星被抬起（后坐力）", standBurst.pitchClimb > 1.0,
+    ["开火时准星逐渐往上飘", standBurst.pitchClimb > 1.0,
       `俯仰 ${standBurst.pitchBefore.toFixed(1)}° → 峰值 ${(standBurst.pitchBefore + standBurst.pitchClimb).toFixed(1)}°，`
-      + `抬升 ${standBurst.pitchClimb.toFixed(1)}°（每发 ${recoilPerShot}°、上限 ${recoilMax}°）`],
-    ["后坐力会自行回落", recovered,
-      `松开后残余 ${recoilLeft.toFixed(2)}°`],
-    ["后坐力不超过上限", standBurst.peakRecoil <= recoilMax + 0.3,
-      `峰值 ${standBurst.peakRecoil.toFixed(2)}°（上限 ${recoilMax}°，配置值）`],
+      + `飘升 ${standBurst.pitchClimb.toFixed(1)}°（每发 ${recoilPerShot}°、最大俯仰 ${pitchMax}°）`],
+    ["飘上去后不回落（准星留在原位不动）", holdDrift < 0.5 && climbedTotal > 1.0,
+      `松手瞬间 ${standBurst.pitchAfterRelease.toFixed(1)}°，1.5 秒后 ${pitchHeld.toFixed(1)}°`
+      + `（漂移 ${holdDrift.toFixed(2)}°，约 0 才对），比开火前高 ${climbedTotal.toFixed(1)}°`],
+    ["持续开火会继续往上飘", secondBurst.pitchClimb > 0.5,
+      `第二轮又飘 ${secondBurst.pitchClimb.toFixed(1)}°`],
+    ["飘升不超过俯仰上限", pitchHeld <= pitchMax + 0.3,
+      `俯仰 ${pitchHeld.toFixed(1)}°（上限 ${pitchMax}°，配置值）`],
     ["按住 Shift 会下蹲", crouched !== null,
       `下蹲程度 ${(crouched?.crouch ?? 0).toFixed(2)}（0 站、1 蹲）`],
     ["下蹲时相机降低", crouched !== null && crouched.camY < crouchBefore.camY - 0.2,
@@ -867,7 +883,7 @@ async function checkShoot() {
       `站立抬 ${standBurst.pitchClimb.toFixed(1)}° / 下蹲抬 ${crouchBurst.pitchClimb.toFixed(1)}°`],
     ["松开 Shift 后能站起来", standAfter !== null && standAfter.crouch < 0.05,
       `下蹲程度 ${(standAfter?.crouch ?? -1).toFixed(2)}，相机回到 ${(standAfter?.camY ?? 0).toFixed(2)} 米`],
-    ["被打的人扣了血", betaHealth < 100, `beta 血量 ${betaHealth}`],
+    ["被打的人扣了血", betaHealth < 100, `beta 最低血量 ${betaHealth}`],
     ["血量归零后重生回满血", betaHealth > 0 || revived !== null,
       betaHealth > 0 ? `未打死（剩 ${betaHealth}）` : `重生后 ${revived?.health ?? "未恢复"}`],
   ];

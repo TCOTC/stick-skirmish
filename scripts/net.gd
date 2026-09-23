@@ -447,19 +447,17 @@ func _publish() -> void:
 	if _player != null and "shots_fired" in _player:
 		shots = int(_player.get("shots_fired"))
 
-	# 后坐力与下蹲的实时值，供自动化检查验证“开火抬枪、松开回落、蹲下减后坐”。
-	var recoil := 0.0
+	# 后坐力与下蹲的实时值，供自动化检查验证“开火逐渐上飘、不回落、蹲下上飘更小”。
+	# 后坐力现在写进俯仰基准里，所以“抬了多少”就由 pitchDeg 本身反映，不再单列一个量。
 	var crouch := 0.0
 	var pitch_deg := 0.0
 	var cam_y := 0.0
-	# 后坐力与下蹲的配置值一并报出去：自动化检查据此断言，
-	# 这样改了配置之后测试会跟着变，而不是在测试里另写一份常量（两个真相来源）。
+	# 配置值一并报出去：自动化检查据此断言，改了配置测试会跟着变，
+	# 而不是在测试里另写一份常量（那样就有两个真相来源）。
 	var recoil_per_shot_deg := 0.0
-	var recoil_max_deg := 0.0
+	var pitch_max_deg := 0.0
 	var crouch_recoil_scale := 1.0
 	if _player != null:
-		if _player.has_method("recoil_deg"):
-			recoil = float(_player.call("recoil_deg"))
 		if _player.has_method("crouch_amount"):
 			crouch = float(_player.call("crouch_amount"))
 		if _player.has_method("aim_pitch"):
@@ -468,9 +466,8 @@ func _publish() -> void:
 		if arm != null:
 			cam_y = arm.position.y
 		recoil_per_shot_deg = float(_player.get("recoil_per_shot_deg"))
-		recoil_max_deg = float(_player.get("recoil_max_deg"))
+		pitch_max_deg = float(_player.get("pitch_max_deg"))
 		crouch_recoil_scale = float(_player.get("crouch_recoil_scale"))
-		recoil = snappedf(recoil, 0.01)
 		crouch = snappedf(crouch, 0.01)
 		pitch_deg = snappedf(pitch_deg, 0.01)
 		cam_y = snappedf(cam_y, 0.01)
@@ -504,12 +501,12 @@ func _publish() -> void:
 		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
 		"health": own_health,
 		"shots": shots,
-		"recoilDeg": recoil,
+		"recoilDeg": pitch_deg,
 		"crouch": crouch,
 		"pitchDeg": pitch_deg,
 		"camY": cam_y,
 		"recoilPerShotDeg": recoil_per_shot_deg,
-		"recoilMaxDeg": recoil_max_deg,
+		"pitchMaxDeg": pitch_max_deg,
 		"crouchRecoilScale": crouch_recoil_scale,
 		"fx": _count_fx(),
 		"headScreenY": head_screen_y,

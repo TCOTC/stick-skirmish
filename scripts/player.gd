@@ -34,15 +34,11 @@ extends CharacterBody3D
 ## 倒地后多久重生（秒）。
 @export var respawn_delay: float = 3.0
 
-## 每发抬起的俯仰角（度）。后坐力抬升是**真抬准星**：
-## 子弹方向取自镜头，所以枪口与弹道会一起上去，而不是只晃一下画面。
+## 每发抬起的俯仰角（度）。
+##
+## 后坐力是**累积上飘且不回落**的：连发时准星逐渐往上飘，松开后**停在抬起的位置**，
+## 要靠自己把鼠标往下压来补偿。这比“抬一下再弹回去”更吃操作，也让压枪成为一门手艺。
 @export var recoil_per_shot_deg: float = 1.4
-## 连发时后坐力最多累积到这个角度（度），否则持续扫射会把准星抬到天上。
-@export var recoil_max_deg: float = 7.0
-## 后坐力的回落速度（指数逼近系数）。它和射速一起决定连发时的稳态抬升：
-## 稳态 ≈ 每发角度 ÷ (1 - e^(-回落速度 × 射击间隔))。
-## 曾用 7.0，稳态只有约 2°，视觉上几乎看不出来，所以放缓到 4.5（稳态约 4°）。
-@export var recoil_recovery: float = 4.5
 
 ## 站立时相机相对角色的高度（米）。下蹲时会降到 crouch_cam_y。
 ##
@@ -69,10 +65,9 @@ const MOVE_ACTIONS := ["move_forward", "move_back", "move_left", "move_right", "
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
 const StickFigureScript := preload("res://scripts/stick_figure.gd")
 
-# 鼠标控制的**基准**俯仰。后坐力不写进这里，否则回落时会把鼠标的瞄准一起拽走。
+# 鼠标控制的**基准**俯仰。后坐力也写进这里（它要留在原地不回落），
+# 所以玩家得靠往下拖鼠标把准星压回来。正值为向上看。
 var _pitch: float = -0.22
-# 后坐力额外抬起的角度（弧度），会自行回落到 0。
-var _recoil := 0.0
 # 下蹲程度：0 = 站立，1 = 完全蹲下。
 var _crouch := 0.0
 var _gravity: float = 24.0
@@ -163,8 +158,7 @@ func _physics_process(delta: float) -> void:
 	_fire_cd = maxf(0.0, _fire_cd - delta)
 	_fire_block = maxf(0.0, _fire_block - delta)
 
-	# 这三件事与生死无关（倒地时枪口姿态也要正确收尾），所以放在存活判断之前。
-	_update_recoil(delta)
+	# 这两件事与生死无关（倒地时枪口姿态也要正确收尾），所以放在存活判断之前。
 	_update_stance(active, delta)
 	_apply_aim()
 
@@ -207,16 +201,6 @@ func _physics_process(delta: float) -> void:
 		_try_fire()
 
 
-## 后坐力自行回落。它是**叠加**在基准俯仰上的，不写回 `_pitch`，
-## 否则回落时会把鼠标瞄到的位置一起拽下来（瞄准会“自己往下飘”）。
-func _update_recoil(delta: float) -> void:
-	if _recoil <= 0.0:
-		return
-	_recoil = lerpf(_recoil, 0.0, 1.0 - exp(-recoil_recovery * delta))
-	if _recoil < 0.0005:
-		_recoil = 0.0
-
-
 ## 站立↔下蹲的过渡。下蹲只改相机高度与移动速度，碰撞胶囊高度不变——
 ## 所以现在是“视觉上的蹲”，还没法真的钻进矮掩体。要做成真下蹲得同步改胶囊。
 func _update_stance(active: bool, delta: float) -> void:
@@ -227,11 +211,9 @@ func _update_stance(active: bool, delta: float) -> void:
 	_arm.position.y = lerpf(stand_cam_y, crouch_cam_y, _crouch)
 
 
-## 当前生效的俯仰 = 鼠标基准 + 后坐力。子弹方向与枪口都取这个值。
+## 当前生效的俯仰。子弹方向与枪口都取这个值，后坐力的抬升也在其中。
 func aim_pitch() -> float:
-	return clampf(
-		_pitch + _recoil, deg_to_rad(pitch_min_deg), deg_to_rad(pitch_max_deg)
-	)
+	return _pitch
 
 
 func _apply_aim() -> void:
@@ -243,16 +225,16 @@ func crouch_amount() -> float:
 	return _crouch
 
 
-## 当前后坐力抬升的角度（度）。供自动化检查读取。
-func recoil_deg() -> float:
-	return rad_to_deg(_recoil)
-
-
-## 开一发的后坐力。累积有上限（recoil_max_deg），否则按住扫射会把准星顶到天上。
+## 开一发的后坐力：把准星往上抬一点，**并且留在那里**。
+##
+## 唯一的边界是俯仰上限（pitch_max_deg）：一直按住不放会飘到顶，此时无法再往上。
+## 不再有“累积上限 + 自行回落”那一套，因为需求是“飘上去不要回原位”。
 func _kick_recoil() -> void:
 	var scale := lerpf(1.0, crouch_recoil_scale, _crouch)
 	var kick := deg_to_rad(recoil_per_shot_deg * scale)
-	_recoil = minf(_recoil + kick, deg_to_rad(recoil_max_deg))
+	_pitch = clampf(
+		_pitch + kick, deg_to_rad(pitch_min_deg), deg_to_rad(pitch_max_deg)
+	)
 
 
 ## 身体随方向键偏转一点，**不超过 lean_deg**。镜头不跟随这个偏转。
@@ -330,10 +312,6 @@ func _try_fire() -> void:
 	_fire_cd = fire_rate
 	shots_fired += 1
 
-	# 后坐力：抬准星。它改的是 _recoil（叠加层），所以回落时不会把鼠标瞄的位置带走；
-	# 下蹲时按 crouch_recoil_scale 削减，这就是“蹲下换稳定”的实惠。
-	_kick_recoil()
-
 	var from := _camera.global_position
 	var dir := -_camera.global_transform.basis.z
 	var hit := _raycast(from, dir, [self])
@@ -351,6 +329,11 @@ func _try_fire() -> void:
 	# 既不会有视差，也不会从自己的身体里穿出去。
 	if Net.connected:
 		Net.broadcast_fire(muzzle, (point - muzzle).normalized())
+
+	# 抬准星放在最后：子弹要飞向**开火前**瞄的那个位置，
+	# 抬起来是留给下一发、以及玩家自己要压回来的那一份。
+	# 写在前面的话，连第一发都会偏掉一个后坐力步长。
+	_kick_recoil()
 
 
 ## 收到别人开火。**由被打中的人判定命中**（本函数在被打者的客户端运行）。
