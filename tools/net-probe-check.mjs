@@ -32,6 +32,7 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseGuardReport, startCursorGuard } from "./cursor-guard.mjs";
 
 const BASE = (process.argv[2] ?? "https://127.0.0.1:8001").replace(/\/$/, "");
 const ARG = process.argv[3];
@@ -265,6 +266,43 @@ function clearClipCursor() {
     }
   } catch (err) {
     console.log(`  ⚠ 解除鼠标裁剪失败，可手动运行 tools/free-cursor.ps1（${err.message}）`);
+  }
+}
+
+/** 鼠标在一次测试里最长可以被圈住多久（毫秒）。*/
+const GUARD_MAX_CONFINED_MS = 500;
+
+/**
+ * 把光标守卫的统计打印出来，并把它变成断言。
+ *
+ * 【为什么要在乎】指针锁定会用 ClipCursor 把用户的光标圈在浏览器窗口里，而“还原”发生在
+ * 窗口销毁的流程里——测试被强杀（例如把输出管道接到 Select-Object -First，读满 N 行时
+ * 就会掐掉上游）就来不及还原，限制作为孤儿留在系统里，症状是鼠标只能在屏幕一角活动。
+ * 守卫就是为此存在的，它必须做到两件事：
+ *   1. 运行期间把裁剪清掉，所以鼠标在任何一个瞬间都不会被困超过一个采样间隔
+ *   2. 自己退出前再清一次，并**报告离开时的裁剪范围**——与启动时的基准一致才叫干净
+ * 第 2 条是“没留下垃圾”的直接证据，第 1 条是“过程中也不难受”的证据。
+ */
+function reportCursorGuard(stats) {
+  if (!stats) {
+    console.log("  ⚠ 光标守卫没有留下统计（它没起来？）——建议手动跑 tools/free-cursor.ps1");
+    return;
+  }
+  const rectText = (r) => (r ? r.join(",") : "?");
+  console.log(`  光标守卫：清除了 ${stats.cleared} 次鼠标裁剪，`
+    + `最长被圈住 ${stats.worstConfinedMs} 毫秒（采样 ${stats.samples} 次）`);
+  if (stats.orphanChrome > 0) {
+    console.log(`  清掉了 ${stats.orphanChrome} 个遗留的测试 Chrome`);
+  }
+  if (!stats.freed) {
+    console.log(`  ✗ 收尾后光标仍被裁剪：${rectText(stats.final)}`
+      + `（启动时 ${rectText(stats.baseline)}）—— 手动跑 tools/free-cursor.ps1`);
+    process.exitCode = 1;
+  }
+  if (stats.worstConfinedMs > GUARD_MAX_CONFINED_MS) {
+    console.log(`  ✗ 鼠标曾被圈住 ${stats.worstConfinedMs} 毫秒，`
+      + `超过上限 ${GUARD_MAX_CONFINED_MS}——守卫的采样间隔是不是被改大了？`);
+    process.exitCode = 1;
   }
 }
 
@@ -524,6 +562,12 @@ console.log(`  检查模式: ${MODE_LABEL}`);
 console.log(`  临时配置目录: ${tmpRoot}`);
 console.log("");
 
+// 先起光标守卫再启动浏览器：它要在浏览器上锁之前拿到"没被裁剪"的基准值。
+// 这样即使用户手动掐掉这个测试（或它崩溃），鼠标最多被圈住一个采样间隔（0.1 秒）。
+// 时间上限留宽：最坏情况是卡死很久才被发现，而守卫多跑一会的代价只是一个 100 毫秒的睡眠循环。
+// 临时目录也一并交给它：被强杀时测试自己的清理代码没机会跑。
+const guard = startCursorGuard({ minutes: 30, label: "netprobe", profileDir: tmpRoot });
+
 const running = [];
 try {
   for (const inst of instances) {
@@ -548,6 +592,18 @@ try {
     }
     console.log(`  ${inst.name} → ${url}`);
     await inst.cdp.send("Page.navigate", { url });
+
+    // 记分模式要断言“一个人先进房间时显示等待对手”，而那个窗口是否存在取决于
+    // alpha 的 WASM 启动速度与延迟谁先到——实测 alpha 的首页加载偶尔要十几秒，
+    // 于是 beta 反而先连上了，出现偶发假失败（就是这一项）。改成**确定性的顺序**：
+    // 等 alpha 真的连上（那时它必然是房间里的唯一一个人）再启动 beta。
+    if (MODE === "score" && inst.key === "a") {
+      const alone = await waitFor(async () => {
+        const s = await readStat(inst.cdp);
+        return s?.connected === true ? s : null;
+      }, 45_000, 250);
+      if (!alone) console.log("  ⚠ alpha 迟迟没连上，等待对手的窗口可能观察不到");
+    }
   }
   console.log("");
 
@@ -586,6 +642,8 @@ try {
   await releasePointerLock();   // 先交还指针锁
   await stopInstances();        // 优雅关闭，失败才强杀
   clearClipCursor();            // 兜底清一次系统裁剪
+  await guard.stop();           // 最后停守卫：它清了整场的裁剪，现在把统计交出来
+  reportCursorGuard(parseGuardReport(guard.report()));
   for (const inst of instances) inst.cdp?.close();
   try {
     fs.rmSync(tmpRoot, { recursive: true, force: true });

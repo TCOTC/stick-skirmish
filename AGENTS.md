@@ -108,9 +108,24 @@ $env:TEST_JOIN_DELAY_MS='20000'; $env:TEST_ROOM='latejoin';
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --room
 ```
 
-`--score` 模式**自带 6 秒延迟**（除非显式设 `TEST_JOIN_DELAY_MS`）：
-它的第一项断言是“单人时提示等待对手”，而两个实例同时启动时对手往往在第一次采样前
-就已经到场，等待态根本没被看到——实测就是这么假失败过一次。
+`--score` 模式**自带 6 秒延迟**（除非显式设 `TEST_JOIN_DELAY_MS`），并且会
+**等 alpha 真的连上再启动 beta**：它的第一项断言是“单人时提示等待对手”，
+而那个窗口是否存在取决于 alpha 的 WASM 启动速度与延迟谁先到（实测偶发假失败）。
+
+鼠标裁剪（`ClipCursor`）方面的两个工具：
+
+```powershell
+# 自检：人为把系统置成“被裁剪”的坏状态，看守卫能否在一个采样间隔内恢复
+powershell -ExecutionPolicy Bypass -File tools/cursor-guard-check.ps1
+
+# 整个开发时段的手动守护（例如边改代码边用浏览器试玩）
+node tools/cursor-guard.mjs --minutes 60
+
+# 万一手动驱动浏览器时鼠标还是被困住了
+powershell -ExecutionPolicy Bypass -File tools/free-cursor.ps1
+```
+
+测试脚本自己会起守卫（见下方「鼠标不会被开发过程困住」），不需要手动调用。
 
 ## 验证手段
 
@@ -134,13 +149,30 @@ CDP 测试的两个坑：
 - 无头 Chrome 默认不给页面前台焦点 → 指针锁会失败并报
   `WrongDocumentError: The root document ... not valid for pointer lock`。
   先发 `Page.bringToFront`，确认 `document.hasFocus()` 为 true。
-- **测完一定要解除鼠标裁剪（`ClipCursor`）。** 浏览器进入指针锁定时会把光标圈在窗口内，
-  进程被强杀时来不及还原，限制就留在系统里，症状是"鼠标被困在屏幕左上角动不了"。
-  现在由 `tools/net-probe-check.mjs` 自动收尾（先 `exitPointerLock` → 优雅关闭页面 →
-  兜底跑 `free-cursor.ps1`），所以用它跑测试不需要手动处理。
-  但**用别的方式驱动浏览器时仍需手动跑 `tools/free-cursor.ps1`**。
-  注意：强杀（`taskkill /F`）会跳过浏览器的窗口销毁流程，而还原就发生在那里，
-  所以收尾要先让页面自己关。
+- **强杀会跳过浏览器的窗口销毁流程**，而 `ClipCursor` 的还原就发生在那里。
+  所以收尾要先让页面自己关（`Page.close`），再接 `taskkill /T /F` 兜底。
+  现在由 `tools/net-probe-check.mjs` 与 `tools/shot.mjs` 自动顺序处理，不需要手动介入。
+
+### 鼠标不会被开发过程困住（光标守卫）
+
+浏览器进入指针锁定时会用 Windows 的 `ClipCursor` 把光标圈在窗口里；那个限制一旦孤儿化，
+症状是**鼠标只能在屏幕一角移动**（开发期间被用户抱怨过一次）。
+
+靠“收尾时清一次”不够：开发中很容易把测试输出管道接到 `Select-Object -First`（读满 N 行
+就掉掉上游）、或者直接打断，这些路径都到不了收尾。现在改成不依赖收尾：
+
+- `tools/cursor-guard.ps1` 是**独立的守望进程**，每 100 毫秒读一次裁剪范围，
+  发现被改就立刻 `ClipCursor(NULL)`；父进程消失时还会清掉残留的测试 Chrome。
+- `tools/cursor-guard.mjs` 是 Node 侧封装（`startCursorGuard()`），测试脚本在两处用它：
+  `net-probe-check.mjs` 与 `shot.mjs`，且都是**先起守卫再启动浏览器**
+  （基准值必须是“没被裁剪”的真值）。收尾断言两条：离开时的范围与基准一致、
+  单次被圈住不超过 500 毫秒（实测 110～122 毫秒）。
+- `tools/cursor-guard-check.ps1` 是它的自检：人为把系统置成被裁剪的坏状态，
+  验证守卫能恢复（这是唯一能证明守卫有效的办法——正常测试未必触发指针锁定）。
+- 整个开发时段要守护就手动跑 `node tools/cursor-guard.mjs --minutes 60`。
+
+**自纪律：不要把测试脚本的输出管道接到 `Select-Object -First N`。**
+它在读满 N 行时会掉掉上游，等于在随机时刻强杀测试。要截取输出就写进日志文件再读。
 
 ## 已经踩过并修好的坑（别踩第二遍）
 
@@ -160,7 +192,15 @@ CDP 测试的两个坑：
 - **退出全屏是浏览器原生行为**，不要重复实现（曾经写过 `pointerlockchange → exitFullscreen`，
   验证后发现纯属多余，已删）。
 - **这台机器的 PowerShell 5.1 按 ANSI 读 `.ps1`**，带中文的脚本必须存成 UTF-8 **带 BOM**，
-  否则直接语法崩溃。
+  否则直接语法崩溃。新建带中文的 `.ps1` 后要用
+  `[IO.File]::WriteAllText($p, $s, (New-Object System.Text.UTF8Encoding($true)))` 补 BOM，
+  并用 `[System.Management.Automation.Language.Parser]::ParseFile()` 复核语法。
+- **PowerShell 5.1 的后台进程要活过父进程，得让它拿到自己的控制台。** 用 Node 的
+  `spawn("powershell", …)` 直接启的子进程与测试进程**共用控制台**：测试被强杀时控制台关闭，
+  子进程会收到 CTRL_CLOSE 一起死（实测：守望日志只剩一行 `started`，退出路径一个标记都没有）。
+  改成 `Start-Process -WindowStyle Hidden` 包一层即可（子进程拿到自己的控制台）。
+  另外 `detached: true` + `windowsHide: true` + `stdio: "ignore"` 在 PS 5.1 上
+  **会让子进程根本起不来**，不要用这条路。
 - **Godot 的 WebSocket 客户端要求第一个包是 4 字节编号**：内容是小端 int32 的自身编号且 ≥ 2，
   否则主动断开并报 `Invalid ID received from server`。另外它把收到的每个包都标记为来自 1 号，
   发送方身份因此无法获知，影响 `rpc_id` 定向与 `MultiplayerSynchronizer` 的 peer 可见性。

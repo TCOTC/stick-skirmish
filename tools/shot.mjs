@@ -21,6 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseGuardReport, startCursorGuard } from "./cursor-guard.mjs";
 
 const CHROME = process.env.CHROME
   ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
@@ -167,6 +168,9 @@ if (!fs.existsSync(CHROME)) {
 }
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), "stick-shot-"));
+// 先起光标守卫再启动浏览器：它要在浏览器上锁之前拿到“没被裁剪”的基准值。
+// 即使用户手动掐掉这次截图（或它崩溃），鼠标最多被圈住一个采样间隔（0.1 秒）。
+const guard = startCursorGuard({ minutes: 15, label: "shot", profileDir: profile });
 const child = spawn(CHROME, [
   "--headless=new",
   "--enable-unsafe-swiftshader",
@@ -296,10 +300,28 @@ try {
   process.exitCode = 1;
 } finally {
   await releasePointerLock();
+  // 先让页面自己关掉：**优雅关闭**才会走浏览器的窗口销毁流程，而 ClipCursor 的还原就在那里。
+  // 以前这里无条件 taskkill /F（强杀），于是每一次截图都可能在系统里留下一块裁剪区。
   try { await cdp?.send("Page.close"); } catch { /* 页面可能已经没了 */ }
-  await sleep(1200);
+  const closeDeadline = Date.now() + 2500;
+  while (Date.now() < closeDeadline) {
+    if (child.exitCode !== null || child.killed) break;
+    await sleep(200);
+  }
   try { execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* 已退出 */ }
   clearClipCursor();
+  await guard.stop();
+  // 报告守卫统计。它的意义不是“好看”，而是“用户鼠标在这次截图里没被困住”这两条证据：
+  // 过程中最长被圈住多久（采样间隔量级），以及离开时的裁剪范围是否与启动时一致。
+  const guardStats = parseGuardReport(guard.report());
+  if (guardStats) {
+    console.log(`  光标守卫：清除 ${guardStats.cleared} 次裁剪，最长被圈住 ${guardStats.worstConfinedMs} 毫秒`);
+    if (!guardStats.freed) {
+      console.log(`  ✗ 收尾后光标仍被裁剪：${(guardStats.final ?? []).join(",")}`
+        + " —— 手动跑 tools/free-cursor.ps1");
+      process.exitCode = 1;
+    }
+  }
   cdp?.close();
   // 强杀之后文件可能还被占着，删不掉就退避重试几次
   for (let i = 0; i < 5; i++) {
