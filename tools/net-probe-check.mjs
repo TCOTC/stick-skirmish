@@ -790,10 +790,12 @@ async function checkShoot() {
   }
 
   // alpha 要转镜头就得接管鼠标（键盘与鼠标事件只在指针锁定后生效）
+  const idleHint = ready.sa.hud?.hint ?? "";
   const locked = await clickToCapture(a.cdp);
   if (locked) usedPointerLock = true;
   console.log(`  指针锁定: ${locked}`);
   await sleep(1200);   // 让“接管鼠标后短暂不开火”那段时间过去
+  const capturedHint = (await readStat(a.cdp))?.hud?.hint ?? "";
 
   // 点击画面那一下**不该**顺手打出一发：那次点击是用来锁定指针的。
   // 这是最容易被玩家骂的细节之一，所以单独断言。
@@ -949,6 +951,8 @@ async function checkShoot() {
       `当前 ${facingDeg.toFixed(1)}°、目标 ${targetYaw.toFixed(1)}°，差 ${aimErr.toFixed(1)}°`],
     ["点击进入游戏的那一下不开火", shotsAfterCapture === 0,
       `点击后已开火 ${shotsAfterCapture} 发`],
+    ["进游戏前提示点击画面", /CLICK TO PLAY/.test(idleHint), `提示 "${idleHint}"`],
+    ["接管鼠标后提示收起", capturedHint === "", `提示 "${capturedHint}"`],
     ["真的打出去了", shotsDelta > 0, `新增 ${shotsDelta} 发`],
     ["射速受冷却限制（不是每帧一发）", ratePerSec > 3.0 && ratePerSec < 15.0,
       `按住 ${fireMs} ms 打出 ${shotsDelta} 发，合 ${ratePerSec.toFixed(1)} 发/秒（配置 9）`],

@@ -192,6 +192,11 @@ func _physics_process(delta: float) -> void:
 			_fire_block = FIRE_BLOCK_AFTER_CAPTURE
 		else:
 			_stop_moving()
+		# 让 HUD 收起/显示“点一下画面”的提示。没人告诉它的话，
+		# 第一次打开链接的人只会看到一个不会动的场地（浏览器不允许程序自己抢鼠标）。
+		var hud := _hud()
+		if hud != null:
+			hud.call("set_playing", active)
 
 	_fire_cd = maxf(0.0, _fire_cd - delta)
 	_fire_block = maxf(0.0, _fire_block - delta)

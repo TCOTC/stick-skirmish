@@ -49,7 +49,11 @@ var _feed: Array = []
 
 var _flash: ColorRect = null
 var _flash_tween: Tween = null
-# 准星的四根刻度（上、下、左、右），以及当前间距（用来避免重复布局）。
+## “点一下画面才能开始”的提示。文案写死在 HUD 里，玩家只告诉它“我接管鼠标了没”。
+var _hint_box: VBoxContainer = null
+var _hint_main: Label = null
+var _hint_sub: Label = null
+## 准星的四根刻度（上、下、左、右），以及当前间距（用来避免重复布局）。
 var _cross: Array[ColorRect] = []
 var _cross_gap := -1.0
 
@@ -68,6 +72,7 @@ func _ready() -> void:
 	_build_feed()
 	_build_flash()
 	_build_crosshair()
+	_build_hint()
 	# 初始值先填上：player.gd 在 _ready 里推血量时，HUD 可能还没进 group，
 	# 靠那次推送会留下一个空白的血量文字。
 	set_health(100, 100)
@@ -95,8 +100,7 @@ func set_health(hp: int, max_hp: int) -> void:
 		_bar_label.text = "HP %d / %d" % [maxi(hp, 0), max_hp]
 
 
-## 受伤时整屏闪一下红。strength 是起始不透明度，倒地时给大一点。
-## 不设输入阻挡（mouse_filter = IGNORE）：它铺满整屏，若参与 GUI 输入会把点击吞掉。
+## 受伤时整屏闪一下红。strength 是起始不透明度，倒地时给大一点。## 不设输入阻挡（mouse_filter = IGNORE）：它铺满整屏，若参与 GUI 输入会把点击吞掉。
 func damage_flash(strength := 0.32) -> void:
 	if _flash == null:
 		return
@@ -137,6 +141,16 @@ func set_down(seconds: float, killer := "") -> void:
 
 
 # --- 比分板 / 横幅 / 击杀提示 -----------------------------------------------
+
+## 是否已经在游玩（鼠标被接管）。没在游玩时显示“点一下画面”的提示。
+##
+## 浏览器不允许程序主动抢鼠标锁定，所以“必须点一下”是硬性前提；
+## 对第一次打开链接的人来说，不说这一句他就只会看到一个不会动的场地。
+func set_playing(playing: bool) -> void:
+	if _hint_box != null:
+		_hint_box.visible = not playing
+
+
 ## 比分板。rows 是 [{name, kills, deaths, me}]，按进入顺序排。
 ## 幂等：行数不变就只改文字，不重建控件。
 func scoreboard(title: String, rows: Array) -> void:
@@ -258,6 +272,13 @@ func kill_count() -> int:
 
 func down_text() -> String:
 	return _down.text if _down != null and _down.visible else ""
+
+
+## 当前显示的提示文字（没显示时为空）。供自动化检查用。
+func hint_text() -> String:
+	if _hint_box == null or not _hint_box.visible:
+		return ""
+	return "%s %s" % [_hint_main.text, _hint_sub.text]
 
 
 func _build_health_bar() -> void:
@@ -440,3 +461,35 @@ func set_spread(deg: float) -> void:
 	_cross[2].offset_right = -gap
 	_cross[3].offset_left = gap
 	_cross[3].offset_right = gap + CROSS_LEN
+
+
+## “点一下画面”的提示，放在画面下方中间（避开左下角的血条）。
+## 文案是英文：Godot 默认字体不含中日韩字形。
+func _build_hint() -> void:
+	_hint_box = VBoxContainer.new()
+	_hint_box.name = "Hint"
+	_hint_box.anchor_left = 0.5
+	_hint_box.anchor_right = 0.5
+	_hint_box.anchor_top = 1.0
+	_hint_box.anchor_bottom = 1.0
+	_hint_box.offset_left = -320.0
+	_hint_box.offset_right = 320.0
+	_hint_box.offset_top = -134.0
+	_hint_box.offset_bottom = -84.0
+	add_child(_hint_box)
+
+	_hint_main = Label.new()
+	_hint_main.name = "Main"
+	_hint_main.text = "CLICK TO PLAY"
+	_hint_main.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_hint_main.add_theme_font_size_override("font_size", 26)
+	_hint_main.add_theme_color_override("font_color", Color(0.85, 0.94, 1.0))
+	_hint_box.add_child(_hint_main)
+
+	_hint_sub = Label.new()
+	_hint_sub.name = "Sub"
+	_hint_sub.text = "MOUSE look   WASD move   SHIFT crouch   LMB fire   ESC release"
+	_hint_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_hint_sub.add_theme_font_size_override("font_size", 14)
+	_hint_sub.add_theme_color_override("font_color", Color(0.66, 0.74, 0.84))
+	_hint_box.add_child(_hint_sub)

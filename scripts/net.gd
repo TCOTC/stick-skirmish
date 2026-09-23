@@ -601,6 +601,7 @@ func _hud_info() -> Dictionary:
 		"hitmarkers": int(hud.call("hitmarker_count")),
 		"kills": int(hud.call("kill_count")),
 		"down": str(hud.call("down_text")),
+		"hint": str(hud.call("hint_text")),
 		"crosshairGap": float(hud.call("crosshair_gap")),
 	}
 
