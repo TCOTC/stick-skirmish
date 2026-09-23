@@ -38,6 +38,9 @@ var connected := false
 var status := "init"
 var room := "game"
 var url := ""
+## 是否显示左上角那行开发信息（房间/编号/状态）。默认只在未连上时显示：
+## 正常游玩时这一行只是噪声，而连不上时它又是唯一能看出问题的地方。
+var _debug_label := false
 
 var _api: MultiplayerAPI = null
 var _peer: WebSocketMultiplayerPeer = null
@@ -66,6 +69,7 @@ func _ready() -> void:
 		return
 
 	room = _query("room", "game")
+	_debug_label = _query("debug", "") == "1"
 	var base := str(JavaScriptBridge.eval(
 		"(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host"
 	))
@@ -108,6 +112,11 @@ func _query(key: String, fallback: String) -> String:
 		"new URLSearchParams(location.search).get('%s') || ''" % key
 	))
 	return value if not value.is_empty() else fallback
+
+
+## 读网址参数。match.gd 也要用它（分数上限可以用 ?kills=1 覆盖），所以做成公开的。
+func query_param(key: String, fallback: String) -> String:
+	return _query(key, fallback)
 
 
 func _process(delta: float) -> void:
@@ -162,6 +171,8 @@ func _on_connected() -> void:
 	# 无条件应用一次：_refresh_styles 只在「位次变了」时才会调它，
 	# 而位次是 0 时“没变”，于是初始化就依赖了“默认样式正好是 0 号”这个巧合。
 	_apply_my_style()
+	# 比分与回合作者只认 Match，连上之后才拿得到自己的编号，所以在这里通知它。
+	Match.on_connected(my_id)
 
 
 func _find_player() -> Node3D:
@@ -183,8 +194,10 @@ func _send_state(delta: float) -> void:
 	# 广播：中继不做定向，rpc() 默认就是发给所有对端。
 	# 发的是**视觉朝向**（火柴人面朝哪边），不是 player.rotation.y（镜头朝向）：
 	# 本地火柴人跟着移动方向转，发镜头朝向的话双方看到的脸就不一致了。
+	# kills/deaths 也一并带上，但接收方**只在第一次见到这个编号时**用它补种比分
+	# （见 match.gd 的文件头），之后比分只跟击杀事件走。
 	rpc("_peer_state", my_id, _player.global_position, _visual_yaw(), _visual_pitch(),
-		_visual_crouch())
+		_visual_crouch(), Match.my_kills(), Match.my_deaths())
 
 
 ## 问玩家节点要当前的外观朝向。外观策略属于 player.gd，这里不自己拼 rotation.y。
@@ -213,7 +226,9 @@ func _visual_crouch() -> float:
 
 ## 收到的每个包都会被标成来自 1 号，所以发送者身份只能自己写在参数里。
 @rpc("any_peer", "call_remote")
-func _peer_state(id: int, pos: Vector3, yaw: float, pitch: float, crouch: float) -> void:
+func _peer_state(
+	id: int, pos: Vector3, yaw: float, pitch: float, crouch: float, kills: int, deaths: int
+) -> void:
 	if id == my_id or id <= 1:
 		return
 
@@ -244,6 +259,10 @@ func _peer_state(id: int, pos: Vector3, yaw: float, pitch: float, crouch: float)
 		_add_avatar_body(_avatars[id])
 		_add_avatar_bar(id, _avatars[id])
 		_refresh_styles()
+		# 只补种这一次：之后的比分以击杀事件为准（详见 match.gd 的文件头）。
+		Match.seed_remote(id, kills, deaths)
+		# 对手到场就是本局真正的开场（先开房间的人之前看到的是“等待对手”）。
+		Match.on_peers_changed(_targets.size())
 
 
 ## 替身也是火柴人：脚底对齐玩家原点，所以位置不加偏移。
@@ -360,6 +379,7 @@ func _expire_peers() -> void:
 		_avatars.erase(id)
 		print("[net] 玩家 ", id, " 超时离开")
 	_refresh_styles()
+	Match.on_peers_changed(_targets.size())
 
 
 func _smooth_avatars(delta: float) -> void:
@@ -391,6 +411,9 @@ func _update_hud() -> void:
 		_label.add_theme_color_override("font_color", Color(0.72, 0.86, 1.0))
 		_hud.add_child(_label)
 
+	# 连上了就不再占着屏幕：房间名与等待提示已经由 Match 的横幅负责，
+	# 而这行字（编号/rank/状态）只是排查用的。要看就加 ?debug=1。
+	_label.visible = _debug_label or not connected
 	var text := "room=%s  me=%d  rank=%d  %s" % [room, my_id, _my_rank, status]
 	if connected and not _targets.is_empty():
 		text += "  others=%s" % str(_targets.keys())
@@ -458,11 +481,16 @@ func _publish() -> void:
 	var pitch_max_deg := 0.0
 	var crouch_recoil_scale := 1.0
 	var recoil_yaw_deg := 0.0
+	var spread_deg := 0.0
+	var spread_min_deg := 0.0
+	var spread_max_deg := 0.0
 	if _player != null:
 		if _player.has_method("crouch_amount"):
 			crouch = float(_player.call("crouch_amount"))
 		if _player.has_method("aim_pitch"):
 			pitch_deg = rad_to_deg(float(_player.call("aim_pitch")))
+		if _player.has_method("spread_amount"):
+			spread_deg = float(_player.call("spread_amount"))
 		var arm := _player.get_node_or_null("SpringArm")
 		if arm != null:
 			cam_y = arm.position.y
@@ -470,9 +498,12 @@ func _publish() -> void:
 		pitch_max_deg = float(_player.get("pitch_max_deg"))
 		crouch_recoil_scale = float(_player.get("crouch_recoil_scale"))
 		recoil_yaw_deg = float(_player.get("recoil_yaw_deg"))
+		spread_min_deg = float(_player.get("spread_min_deg"))
+		spread_max_deg = float(_player.get("spread_max_deg"))
 		crouch = snappedf(crouch, 0.01)
 		pitch_deg = snappedf(pitch_deg, 0.01)
 		cam_y = snappedf(cam_y, 0.01)
+		spread_deg = snappedf(spread_deg, 0.01)
 
 	# 替身的装饰件（命中框、头顶血条）是否还在。
 	# 它们挂在替身节点下，而外观重建曾经会把子节点全删掉，把这两个一起吞了——
@@ -491,10 +522,12 @@ func _publish() -> void:
 		"myId": my_id,
 		"myRank": _my_rank,
 		"myStyle": _style_name(_my_rank),
+		"myName": player_name(my_id),
 		"connected": connected,
 		"status": status,
 		"peers": _targets.keys(),
 		"peerRanks": ranks,
+		"peerNames": _peer_names(),
 		"peerPos": peer_pos,
 		"avatars": _avatars.size(),
 		"avatarYawDeg": avatar_yaw,
@@ -511,10 +544,39 @@ func _publish() -> void:
 		"recoilYawDeg": recoil_yaw_deg,
 		"pitchMaxDeg": pitch_max_deg,
 		"crouchRecoilScale": crouch_recoil_scale,
+		"spreadDeg": spread_deg,
+		"spreadMinDeg": spread_min_deg,
+		"spreadMaxDeg": spread_max_deg,
 		"fx": _count_fx(),
 		"headScreenY": head_screen_y,
+		"sounds": Sfx.live_voices(),
+		"match": Match.snapshot(),
+		"hud": _hud_info(),
 	}
 	JavaScriptBridge.eval("window.__netstat = " + JSON.stringify(snapshot))
+
+
+## 编号 → 名字，供自动化检查核对两端对同一个人的称呼是否一致。
+func _peer_names() -> Dictionary:
+	var names := {}
+	for id in _targets:
+		names[str(id)] = player_name(id)
+	return names
+
+
+## HUD 上真的显示了什么。只读游戏内的数字不够：数字对、界面没画出来也是一样的。
+func _hud_info() -> Dictionary:
+	var hud := _hud_node()
+	if hud == null:
+		return {}
+	return {
+		"scoreboard": str(hud.call("scoreboard_text")),
+		"banner": str(hud.call("banner_text")),
+		"feed": str(hud.call("feed_text")),
+		"hitmarkers": int(hud.call("hitmarker_count")),
+		"kills": int(hud.call("kill_count")),
+		"down": str(hud.call("down_text")),
+	}
 
 
 ## 角色头顶在屏幕上的纵向位置，0 是屏幕顶端、1 是底端。
@@ -552,6 +614,30 @@ func _style_name(rank: int) -> String:
 	return str(styles[((rank % styles.size()) + styles.size()) % styles.size()]["name"])
 
 
+## 当前是否已经有对手在房间里。先开房间的那一方靠它决定要不要提示“等待对手”。
+func has_opponent() -> bool:
+	return not _targets.is_empty()
+
+
+## 编号 → 展示名（记分板与击杀提示要用）。
+##
+## 没有名字输入，就拿火柴人样式名当名字（ember / frost）。两端算出来的结果一致：
+## 样式按**进入房间的顺序**分配，而这个顺序就是编号的大小关系。
+## 还没收到对方任何状态包时（比如击杀事件先到）按编号排序推出位次，
+## 结果仍与 _refresh_styles 一致，不会出现同一个人两边叫两个名字。
+func player_name(id: int) -> String:
+	if id <= 0:
+		return "?"
+	if id == my_id:
+		return _style_name(_my_rank)
+	var rank := int(_avatar_ranks.get(id, -1))
+	if rank < 0:
+		var ids := _known_ids()
+		ids.sort()
+		rank = maxi(0, ids.find(id))
+	return _style_name(rank)
+
+
 ## 镜头相对玩家参考系的偏转。相机跟随外观，所以它应当与 facingDeg 一致。
 func _cam_offset() -> float:
 	if _player != null and _player.has_method("camera_offset_yaw"):
@@ -561,11 +647,22 @@ func _cam_offset() -> float:
 
 # --- 射击同步 ---------------------------------------------------------------
 
-## 告诉所有人“我开了一枪”。origin 是枪口，direction 是指向命中点的方向。
+## 告诉所有人“我开了一枪”。origin 是枪口，direction 是子弹实际飞行的方向
+## （已含散布，所以不是“朝向准星”而是“这一发真的往哪飞”）。
 func broadcast_fire(origin: Vector3, direction: Vector3) -> void:
 	if my_id <= 0:
 		return
 	rpc("_peer_fire", my_id, origin, direction)
+
+
+## 告诉所有人“我倒下了，凶手是他”。killer_id 为 0 表示没有明确凶手。
+##
+## 击杀由**被打者**广播：判定权本来就在他手上（见 player.gd 的 receive_shot），
+## 中继对所有人是同一份转发，所以两端按同一顺序得到同一条事件，比分天然一致。
+func broadcast_kill(victim_id: int, killer_id: int) -> void:
+	if my_id <= 0:
+		return
+	rpc("_peer_kill", victim_id, killer_id)
 
 
 ## 血量变化时告知所有人（包括自己被打倒后重生回满血）。
@@ -589,13 +686,27 @@ func _peer_fire(shooter_id: int, origin: Vector3, direction: Vector3) -> void:
 	if not hit.is_empty():
 		end = hit["position"]
 	Fx.tracer(origin, end, color)
+	# 别人的枪声按世界位置播放：能听出他在左边还是右边，是这个视角下唯一的空间线索。
+	Sfx.play_shot(origin)
 	if not hit.is_empty():
 		Fx.impact(hit["position"], hit["normal"], color)
+		Sfx.play_impact(hit["position"])
 
 	if _player != null and _player.has_method("receive_shot"):
 		# 伤害取**本地**配置：判定权在被击中的人这边，伤害量也一并归他管，
 		# 这样两端的“谁定结果”是同一个，不会一半在一个客户端、一半在另一个。
-		_player.call("receive_shot", origin, direction, int(_player.get("bullet_damage")))
+		# 开枪者编号也要传过去：倒下时 Match 靠它给对方记上一分。
+		_player.call(
+			"receive_shot", origin, direction, int(_player.get("bullet_damage")), shooter_id
+		)
+
+
+## 收到击杀事件（由被打者广播，见 broadcast_kill）。
+@rpc("any_peer", "call_remote")
+func _peer_kill(victim_id: int, killer_id: int) -> void:
+	if victim_id == my_id or victim_id <= 1:
+		return
+	Match.apply_remote_kill(victim_id, killer_id)
 
 
 ## 收到血量变化。打中提示就是从这里来的：看到别人的血真的掉了才算命中。

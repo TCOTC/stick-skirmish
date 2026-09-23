@@ -21,6 +21,13 @@ Fx="*res://scripts/fx.gd"
 ; 联机：每个客户端广播自己的位置，并为其他玩家画替身（见 scripts/net.gd）。
 Net="*res://scripts/net.gd"
 
+; 比分与回合：谁打倒了谁、什么时候到分数上限、下一回合怎么开（见 scripts/match.gd）。
+; 放在 Net 之后：它在 _ready 里要读网址参数，用的是 Net 的 query_param。
+Match="*res://scripts/match.gd"
+
+; 程序化音效（无素材，启动时合成 wav）。见 scripts/sfx.gd。
+Sfx="*res://scripts/sfx.gd"
+
 ; 临时：联机连通性探针，只有网址带 ?probe=1 时才做事。
 ; 验证完联机方案后连同 scripts/net_probe.gd 一起删。
 NetProbe="*res://scripts/net_probe.gd"

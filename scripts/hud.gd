@@ -1,15 +1,25 @@
 extends CanvasLayer
-## HUD：血量条、命中提示、倒地提示。
+## HUD：血量条、受伤红闪、命中提示、倒地提示、比分板、胜负横幅、击杀提示。
 ##
 ## 控件全部用代码建（`main.tscn` 里只留已有的准星），因为准星的位置与尺寸是场景数据、
 ## 而血量条这类会随状态变化的东西，写在代码里比在 .tscn 里改偏移量清楚。
 ##
 ## 文字一律用英文或数字：Godot 默认字体不含中日韩字形，中文会显示成空白方块。
+##
+## 它只是“显示层”：谁打倒了谁、回合结没结束都属于 Match 的职责，
+## 这里只提供 `scoreboard` / `banner` / `feed` 这些幂等的写接口。
 
 const BAR_WIDTH := 240.0
 const BAR_HEIGHT := 16.0
 
 const HITMARKER_TIME := 0.14
+## 击杀提示停留更久一点，让它与普通命中区分得开。
+const KILLMARKER_TIME := 0.45
+## 一条击杀提示存活多久（秒），以及最多同时显示几条。
+const FEED_TIME := 3.5
+const FEED_MAX := 4
+## 受伤红闪的淡出时长（秒）。
+const FLASH_TIME := 0.35
 
 var _bar_fill: ColorRect = null
 var _bar_label: Label = null
@@ -17,12 +27,35 @@ var _hitmarker: Label = null
 var _down: Label = null
 var _hitmarker_left := 0.0
 
+var _score_title: Label = null
+var _score_box: VBoxContainer = null
+var _score_rows: Array[Label] = []
+
+var _banner_box: VBoxContainer = null
+var _banner_main: Label = null
+var _banner_sub: Label = null
+
+var _feed_box: VBoxContainer = null
+# 每条 = {node: Label, left: float}
+var _feed: Array = []
+
+var _flash: ColorRect = null
+var _flash_tween: Tween = null
+
+# 命中提示出现过几次（含击杀）。供自动化检查确认提示真的触发过。
+var _hitmarker_count := 0
+var _kill_count := 0
+
 
 func _ready() -> void:
 	add_to_group("hud")
 	_build_health_bar()
 	_build_hitmarker()
 	_build_down_label()
+	_build_scoreboard()
+	_build_banner()
+	_build_feed()
+	_build_flash()
 	# 初始值先填上：player.gd 在 _ready 里推血量时，HUD 可能还没进 group，
 	# 靠那次推送会留下一个空白的血量文字。
 	set_health(100, 100)
@@ -33,7 +66,8 @@ func _process(delta: float) -> void:
 		_hitmarker_left -= delta
 		if _hitmarker_left <= 0.0 and _hitmarker != null:
 			_hitmarker.visible = false
-	else:
+	_tick_feed(delta)
+	if _hitmarker_left <= 0.0 and _feed.is_empty():
 		set_process(false)
 
 
@@ -49,17 +83,36 @@ func set_health(hp: int, max_hp: int) -> void:
 		_bar_label.text = "HP %d / %d" % [maxi(hp, 0), max_hp]
 
 
-## 命中提示：打中别人时闪一下。
-func hitmarker() -> void:
+## 受伤时整屏闪一下红。strength 是起始不透明度，倒地时给大一点。
+## 不设输入阻挡（mouse_filter = IGNORE）：它铺满整屏，若参与 GUI 输入会把点击吞掉。
+func damage_flash(strength := 0.32) -> void:
+	if _flash == null:
+		return
+	if _flash_tween != null and _flash_tween.is_valid():
+		_flash_tween.kill()
+	_flash.color = Color(0.85, 0.10, 0.12, clampf(strength, 0.0, 1.0))
+	_flash_tween = create_tween()
+	_flash_tween.tween_property(_flash, "color:a", 0.0, FLASH_TIME)
+
+
+## 命中提示：打中别人时闪一下。kill = true 时用红色并停留更久。
+func hitmarker(kill := false) -> void:
 	if _hitmarker == null:
 		return
+	_hitmarker_count += 1
+	if kill:
+		_kill_count += 1
+	_hitmarker.text = "X" if kill else "x"
+	_hitmarker.add_theme_color_override(
+		"font_color", Color(1.0, 0.32, 0.28) if kill else Color(1.0, 0.95, 0.4)
+	)
 	_hitmarker.visible = true
-	_hitmarker_left = HITMARKER_TIME
+	_hitmarker_left = KILLMARKER_TIME if kill else HITMARKER_TIME
 	set_process(true)
 
 
-## 倒地提示。seconds <= 0 时隐藏。
-func set_down(seconds: float) -> void:
+## 倒地提示。seconds <= 0 时隐藏。killer 是把自己打倒的人的名字（可为空）。
+func set_down(seconds: float, killer := "") -> void:
 	if _down == null:
 		return
 	if seconds <= 0.0:
@@ -67,6 +120,129 @@ func set_down(seconds: float) -> void:
 		return
 	_down.visible = true
 	_down.text = "DOWN  %.1f" % seconds
+	if not killer.is_empty():
+		_down.text += "   (by %s)" % killer
+
+
+# --- 比分板 / 横幅 / 击杀提示 -----------------------------------------------
+
+## 比分板。rows 是 [{name, kills, deaths, me}]，按进入顺序排。
+## 幂等：行数不变就只改文字，不重建控件。
+func scoreboard(title: String, rows: Array) -> void:
+	if _score_box == null:
+		return
+	_score_title.text = title
+	while _score_rows.size() < rows.size():
+		var label := Label.new()
+		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		label.add_theme_font_size_override("font_size", 18)
+		_score_box.add_child(label)
+		_score_rows.append(label)
+	while _score_rows.size() > rows.size():
+		var extra: Label = _score_rows.pop_back()
+		extra.queue_free()
+	for i in rows.size():
+		var row: Dictionary = rows[i]
+		var label := _score_rows[i]
+		# rpad 让两行的数字对齐：默认字体不是等宽，用空格排版就得先补齐名字长度。
+		label.text = "%s %2d / %d" % [str(row["name"]).rpad(6), int(row["kills"]), int(row["deaths"])]
+		label.add_theme_color_override(
+			"font_color", Color(0.72, 0.94, 1.0) if bool(row["me"]) else Color(0.62, 0.66, 0.74)
+		)
+
+
+## 胜负 / 回合横幅。main 为空表示收起。color 是主标题颜色。
+func banner(main: String, sub: String, color := Color(0.72, 0.94, 1.0)) -> void:
+	if _banner_box == null:
+		return
+	if main.is_empty():
+		_banner_box.visible = false
+		return
+	_banner_box.visible = true
+	_banner_main.text = main
+	_banner_main.add_theme_color_override("font_color", color)
+	_banner_sub.text = sub
+	_banner_sub.visible = not sub.is_empty()
+
+
+## 击杀提示：一行字排在最上面，几秒后自己淡出。
+func feed(text: String) -> void:
+	if _feed_box == null:
+		return
+	var label := Label.new()
+	label.text = text
+	label.add_theme_font_size_override("font_size", 15)
+	label.add_theme_color_override("font_color", Color(0.92, 0.80, 0.55))
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_feed_box.add_child(label)
+	# 新的一条排在最上面
+	_feed_box.move_child(label, 0)
+	_feed.push_front({"node": label, "left": FEED_TIME})
+	# 超出上限的立刻收掉，不让它堆在屏幕上
+	while _feed.size() > FEED_MAX:
+		var old: Dictionary = _feed.pop_back()
+		var old_label: Label = old["node"]
+		if is_instance_valid(old_label):
+			old_label.queue_free()
+	set_process(true)
+
+
+func _tick_feed(delta: float) -> void:
+	if _feed.is_empty():
+		return
+	var keep: Array = []
+	for item in _feed:
+		var label: Label = item["node"]
+		if not is_instance_valid(label):
+			continue
+		var left := float(item["left"]) - delta
+		if left <= 0.0:
+			label.queue_free()
+			continue
+		# 最后 0.8 秒淡出，避免突然消失
+		label.modulate.a = clampf(left / 0.8, 0.0, 1.0)
+		item["left"] = left
+		keep.append(item)
+	_feed = keep
+
+
+# --- 供自动化检查读取 -------------------------------------------------------
+
+## 比分板的文字（按行用 " | " 连接）。检查“界面真的显示了比分”要靠它，
+## 只读 Match 里的数字不够——数字对、界面没画出来也是一样的。
+func scoreboard_text() -> String:
+	var parts := PackedStringArray()
+	for label in _score_rows:
+		if is_instance_valid(label):
+			parts.append(label.text)
+	return " | ".join(parts)
+
+
+func banner_text() -> String:
+	if _banner_box == null or not _banner_box.visible:
+		return ""
+	return "%s %s" % [_banner_main.text, _banner_sub.text]
+
+
+func feed_text() -> String:
+	var parts := PackedStringArray()
+	for item in _feed:
+		var label: Label = item["node"]
+		if is_instance_valid(label):
+			parts.append(label.text)
+	return " | ".join(parts)
+
+
+func hitmarker_count() -> int:
+	return _hitmarker_count
+
+
+func kill_count() -> int:
+	return _kill_count
+
+
+func down_text() -> String:
+	return _down.text if _down != null and _down.visible else ""
 
 
 func _build_health_bar() -> void:
@@ -109,6 +285,7 @@ func _build_hitmarker() -> void:
 	_hitmarker = Label.new()
 	_hitmarker.name = "Hitmarker"
 	_hitmarker.text = "x"
+	_hitmarker.add_theme_font_size_override("font_size", 20)
 	_hitmarker.anchor_left = 0.5
 	_hitmarker.anchor_top = 0.5
 	_hitmarker.anchor_right = 0.5
@@ -129,11 +306,80 @@ func _build_down_label() -> void:
 	_down.anchor_top = 0.5
 	_down.anchor_right = 0.5
 	_down.anchor_bottom = 0.5
-	_down.offset_left = -70.0
+	_down.offset_left = -110.0
 	_down.offset_top = 60.0
-	_down.offset_right = 70.0
+	_down.offset_right = 110.0
 	_down.offset_bottom = 100.0
 	_down.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_down.add_theme_color_override("font_color", Color(1.0, 0.35, 0.3))
 	_down.visible = false
 	add_child(_down)
+
+
+func _build_scoreboard() -> void:
+	_score_box = VBoxContainer.new()
+	_score_box.name = "Scoreboard"
+	_score_box.anchor_left = 1.0
+	_score_box.anchor_right = 1.0
+	_score_box.offset_left = -190.0
+	_score_box.offset_right = -16.0
+	_score_box.offset_top = 12.0
+	_score_box.add_theme_constant_override("separation", 2)
+	add_child(_score_box)
+
+	_score_title = Label.new()
+	_score_title.name = "Title"
+	_score_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_score_title.add_theme_font_size_override("font_size", 13)
+	_score_title.add_theme_color_override("font_color", Color(0.55, 0.60, 0.68))
+	_score_box.add_child(_score_title)
+
+
+func _build_banner() -> void:
+	_banner_box = VBoxContainer.new()
+	_banner_box.name = "Banner"
+	# 锚在顶部中央：不放进屏幕正中，免得挡住准星与对手
+	_banner_box.anchor_left = 0.5
+	_banner_box.anchor_right = 0.5
+	_banner_box.offset_left = -260.0
+	_banner_box.offset_right = 260.0
+	_banner_box.offset_top = 92.0
+	_banner_box.offset_bottom = 210.0
+	_banner_box.visible = false
+	add_child(_banner_box)
+
+	_banner_main = Label.new()
+	_banner_main.name = "Main"
+	_banner_main.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_banner_main.add_theme_font_size_override("font_size", 52)
+	_banner_box.add_child(_banner_main)
+
+	_banner_sub = Label.new()
+	_banner_sub.name = "Sub"
+	_banner_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_banner_sub.add_theme_font_size_override("font_size", 20)
+	_banner_sub.add_theme_color_override("font_color", Color(0.82, 0.88, 0.95))
+	_banner_box.add_child(_banner_sub)
+
+
+func _build_feed() -> void:
+	_feed_box = VBoxContainer.new()
+	_feed_box.name = "Feed"
+	_feed_box.anchor_left = 1.0
+	_feed_box.anchor_right = 1.0
+	_feed_box.offset_left = -240.0
+	_feed_box.offset_right = -16.0
+	_feed_box.offset_top = 84.0
+	_feed_box.add_theme_constant_override("separation", 1)
+	add_child(_feed_box)
+
+
+func _build_flash() -> void:
+	_flash = ColorRect.new()
+	_flash.name = "DamageFlash"
+	_flash.anchor_right = 1.0
+	_flash.anchor_bottom = 1.0
+	_flash.color = Color(0.85, 0.10, 0.12, 0.0)
+	# 铺满整屏的控件若参与 GUI 输入，会把点击吞掉（接管鼠标也要靠那一下点击）。
+	_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(_flash)

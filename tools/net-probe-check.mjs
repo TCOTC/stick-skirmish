@@ -6,16 +6,18 @@
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --room     # 双方能不能看见对方
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --walk     # 走路时关节有没有在动
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --shoot    # 能否打中对方并扣血
+ *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --score    # 记分、判胜负与下一回合
  *
  * 探针模式跑 scripts/net_probe.gd（需 ?probe=1），检查 wss 连接、中继转发、
  * Godot 高层 API 与广播 rpc；房间模式跑 scripts/net.gd，检查两个客户端进入同一房间后
  * 互相看到对方的替身与样式分配；走路模式注入真实的鼠标点击与键盘事件，
  * 读取火柴人的关节角度与自身位置，验证“走路时腿真的在摆、人真的在动”；
- * 射击模式把 alpha 转向 beta、开火，验证命中的判定与扣血真的发生在被打者身上。
+ * 射击模式把 alpha 转向 beta、开火，验证命中的判定与扣血真的发生在被打者身上；
+ * 记分模式用 ?kills=1 把一局压缩到几秒，验证记分、胜负横幅与下一回合的重置。
  *
  * 环境变量：
  *   NET_SHOT_DIR      每个实例收尾时把画面截图写到这个目录（用来人眼核对）
- *   NET_CHECK_TIMEOUT_MS / TEST_ROOM / TEST_JOIN_DELAY_MS / WALK_ROOM / SHOOT_ROOM
+ *   NET_CHECK_TIMEOUT_MS / TEST_ROOM / TEST_JOIN_DELAY_MS / WALK_ROOM / SHOOT_ROOM / SCORE_ROOM
  *
  * 前置：另开一个终端跑 node tools/serve.mjs。
  *
@@ -36,10 +38,12 @@ const ARG = process.argv[3];
 const MODE = ARG === "--room" ? "room"
   : ARG === "--walk" ? "walk"
   : ARG === "--shoot" ? "shoot"
+  : ARG === "--score" ? "score"
   : "probe";
 const ROOM_NAME = process.env.TEST_ROOM ?? "roomtest";
 const WALK_ROOM = process.env.WALK_ROOM ?? "walktest";
 const SHOOT_ROOM = process.env.SHOOT_ROOM ?? "shoottest";
+const SCORE_ROOM = process.env.SCORE_ROOM ?? "scoretest";
 const SHOT_DIR = process.env.NET_SHOT_DIR ?? "";
 // 让第二个实例晚一点再加入，用来复现"一个人先开、另一个人后进"的真实场景。
 const JOIN_DELAY_MS = Number(process.env.TEST_JOIN_DELAY_MS ?? 0);
@@ -382,6 +386,11 @@ async function fireBurst(cdp, samples, opts = {}) {
   const pitchBefore = before?.pitchDeg ?? 0;
   let peak = pitchBefore;
   let minHealth = 999;
+  // 散布跟着连发增长、同时音效播放器会被起起来，这两项只能在开火**期间**取样。
+  let maxSpread = before?.spreadDeg ?? 0;
+  let maxSounds = 0;
+  // 击杀提示只挂 3.5 秒，而一轮射击之后测试还要跑十几秒，所以也得在开火期间取。
+  let feedSeen = "";
 
   await cdp.send("Input.dispatchMouseEvent", {
     type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
@@ -391,6 +400,9 @@ async function fireBurst(cdp, samples, opts = {}) {
     if (s) {
       if (opts.fxSink) opts.fxSink.push(s.fx);
       peak = Math.max(peak, s.pitchDeg ?? 0);
+      maxSpread = Math.max(maxSpread, s.spreadDeg ?? 0);
+      maxSounds = Math.max(maxSounds, s.sounds ?? 0);
+      if (!feedSeen && s.hud?.feed) feedSeen = s.hud.feed;
     }
     if (opts.watch) {
       const w = await readStat(opts.watch);
@@ -411,6 +423,9 @@ async function fireBurst(cdp, samples, opts = {}) {
     pitchClimb: peak - pitchBefore,
     pitchAfterRelease: afterRelease?.pitchDeg ?? 0,
     minHealth,
+    maxSpread,
+    maxSounds,
+    feedSeen,
     shotsBefore: before?.shots ?? 0,
     shotsAfter: afterRelease?.shots ?? 0,
   };
@@ -473,18 +488,23 @@ const instances = MODE === "walk"
     { key: "b", name: "beta", port: DEBUG_PORT + 1 },
   ];
 
-const pageQuery = MODE === "room"
-  ? `?room=${encodeURIComponent(ROOM_NAME)}`
-  : MODE === "walk"
-    ? `?room=${encodeURIComponent(WALK_ROOM)}`
-    : MODE === "shoot"
-      ? `?room=${encodeURIComponent(SHOOT_ROOM)}`
-      : null;
+// 网址参数：房间名决定跟谁同房，kills 决定分数上限。
+// 射击模式故意把上限放到 99：回合重置会把两边送回出生点并恢复朝向，
+// 而那个朝向变化会被“每发左右偏移”的断言当成后坐力数据，把测试弄脏。
+// 记分模式反过来，用 1 杀结束一局，几秒就能跑完一个完整回合。
+const PAGE_QUERY = {
+  room: `?room=${encodeURIComponent(ROOM_NAME)}`,
+  walk: `?room=${encodeURIComponent(WALK_ROOM)}`,
+  shoot: `?room=${encodeURIComponent(SHOOT_ROOM)}&kills=99`,
+  score: `?room=${encodeURIComponent(SCORE_ROOM)}&kills=1`,
+};
+const pageQuery = PAGE_QUERY[MODE] ?? null;
 
 const MODE_LABEL = {
   room: `房间联机（room=${ROOM_NAME}）`,
   walk: `走路动画（room=${WALK_ROOM}）`,
   shoot: `射击命中（room=${SHOOT_ROOM}）`,
+  score: `记分与回合（room=${SCORE_ROOM}，${1} 杀定胜负）`,
   probe: "传输层探针",
 }[MODE];
 
@@ -526,6 +546,8 @@ try {
     await checkWalk();
   } else if (MODE === "shoot") {
     await checkShoot();
+  } else if (MODE === "score") {
+    await checkScore();
   } else {
     await checkProbe();
   }
@@ -834,6 +856,14 @@ async function checkShoot() {
   const fxMax = fxSeen.length ? Math.max(...fxSeen) : 0;
   const ratePerSec = shotsDelta / Math.max(0.001, fireMs / 1000);
 
+  // 再拍一张“打完之后”的画面：此时右侧还挂着击杀提示（只挂 3.5 秒）。
+  if (SHOT_DIR) {
+    const img = await a.cdp.send("Page.captureScreenshot", { format: "png" });
+    const file = path.join(SHOT_DIR, "shoot-after-burst.png");
+    fs.writeFileSync(file, Buffer.from(img.data, "base64"));
+    console.log(`  开火后截图 ${file}（击杀提示还挂着）`);
+  }
+
   // 后坐力**不回落**：准星应当停在抬起后的位置，而不是自己滑回开火前的水准
   // （这段时间里鼠标没动过）。比较基准取**松手那一瞬间**的俯仰，
   // 而不是采样期间的峰值——松手后到采样结束之间还会再打出几发。
@@ -890,7 +920,20 @@ async function checkShoot() {
 
   // 特效应当自己清掉，不能越积越多
   await sleep(1200);
-  const fxAfter = (await readStat(a.cdp))?.fx ?? -1;
+  const finalA = await readStat(a.cdp);
+  const finalB = await readStat(b.cdp);
+  const fxAfter = finalA?.fx ?? -1;
+  // 散布要在这时候读：它按 3.2°/秒回落，再晚就分不清“回落了”与“根本没长大”
+  const spreadRecovered = finalA?.spreadDeg ?? -1;
+  const spreadMin = crouchBefore?.spreadMinDeg ?? 0;
+  const spreadMax = crouchBefore?.spreadMaxDeg ?? 0;
+
+  const idA = ready.sa.myId;
+  const idB = ready.sb.myId;
+  const nameA = ready.sa.myName;
+  const scoreA = finalA?.match?.scores?.[String(idA)] ?? {};
+  const scoreAonB = finalB?.match?.scores?.[String(idA)] ?? {};
+  const deathsB = finalB?.match?.scores?.[String(idB)] ?? {};
 
   console.log("");
   const results = [
@@ -933,6 +976,187 @@ async function checkShoot() {
     ["被打的人扣了血", betaHealth < 100, `beta 最低血量 ${betaHealth}`],
     ["血量归零后重生回满血", betaHealth > 0 || revived !== null,
       betaHealth > 0 ? `未打死（剩 ${betaHealth}）` : `重生后 ${revived?.health ?? "未恢复"}`],
+    ["开火让散布变大", standBurst.maxSpread > spreadMin + 0.3,
+      `散布 ${spreadMin}° → ${standBurst.maxSpread.toFixed(2)}°（上限 ${spreadMax}°，配置值）`],
+    ["散布不超过上限", standBurst.maxSpread <= spreadMax + 0.15,
+      `最大 ${standBurst.maxSpread.toFixed(2)}°，上限 ${spreadMax}°`],
+    ["停火后散布回落到最小", Math.abs(spreadRecovered - spreadMin) < 0.35,
+      `1.2 秒后 ${spreadRecovered}°，最小 ${spreadMin}°`],
+    ["开火起了音效播放器", standBurst.maxSounds > 0,
+      `开火期间同时有 ${standBurst.maxSounds} 个音效在播`],
+    ["打中对方后开枪方出现命中提示", (finalA?.hud?.hitmarkers ?? 0) > 0,
+      `命中提示 ${finalA?.hud?.hitmarkers ?? 0} 次`],
+    ["击倒对方时出现击杀提示", (finalA?.hud?.kills ?? 0) > 0,
+      `击杀提示 ${finalA?.hud?.kills ?? 0} 次`],
+    ["击杀与阵亡各自记在两端", (scoreA.kills ?? 0) >= 1 && (deathsB.deaths ?? 0) >= 1,
+      `alpha 记 ${scoreA.kills ?? "-"} 杀（${nameA}）/ beta 记 ${deathsB.deaths ?? "-"} 阵亡`],
+    ["两端对同一份比分看法一致",
+      (scoreA.kills ?? -1) === (scoreAonB.kills ?? -2) && (scoreA.deaths ?? -1) === (scoreAonB.deaths ?? -2),
+      `alpha 眼中 ${nameA}: ${scoreA.kills ?? "-"} 杀 / beta 眼中 ${nameA}: ${scoreAonB.kills ?? "-"} 杀`],
+    ["记分板与击杀提示真的画在屏幕上",
+      (finalA?.hud?.scoreboard ?? "").includes(nameA)
+      && /[1-9]/.test(finalA?.hud?.scoreboard ?? "")
+      && standBurst.feedSeen.includes(" > "),
+      `记分板 "${finalA?.hud?.scoreboard ?? ""}"、击杀提示（开火期间拍到）"${standBurst.feedSeen}"`],
+  ];
+  console.log("  结论:");
+  for (const [label, ok, detail] of results) {
+    console.log(`  ${ok ? "✓" : "✗"} ${label} — ${detail}`);
+  }
+  console.log("");
+  if (results.some(([, ok]) => !ok)) {
+    process.exitCode = 1;
+    for (const inst of instances) {
+      console.log(`  --- ${inst.name} 控制台 ---`);
+      for (const line of inst.cdp.console.slice(-20)) console.log(`    ${line}`);
+      for (const line of inst.cdp.exceptions.slice(-5)) console.log(`    EXCEPTION ${line}`);
+    }
+  }
+}
+
+/**
+ * 记分模式：用 ?kills=1 把一局压到几秒，验证记分、胜负横幅与下一回合的重置。
+ *
+ * 能自动验证的边界：只有"界面真的显示了什么"需要读 HUD 的文字——比分数字对、
+ * 界面上没画出来也是一样的，所以两项都断言。
+ */
+async function checkScore() {
+  const a = instances.find((i) => i.name === "alpha");
+  const b = instances.find((i) => i.name === "beta");
+
+  await a.cdp.send("Page.bringToFront");
+  await sleep(700);
+
+  // 横幅会换文案：先连上的人先看到 WAITING FOR OPPONENT，对手出现那一刻才喊 ROUND 1。
+  // 所以要把等待期间出现过的文案都收下来，不能只记第一条。
+  const bannersSeen = new Set();
+  const ready = await waitFor(async () => {
+    const sa = await readStat(a.cdp);
+    const sb = await readStat(b.cdp);
+    if (sa?.hud?.banner) bannersSeen.add(sa.hud.banner);
+    if (sa?.connected && sb?.connected && sa.peers.length > 0 && sb.peers.length > 0
+      && sa.hud?.scoreboard) {
+      return { sa, sb };
+    }
+    return null;
+  }, 30_000);
+  if (!ready) {
+    console.log("  联机没就绪，无法测记分。");
+    process.exitCode = 1;
+    return;
+  }
+
+  // 开场横幅比“就绪”判定可能晚一两轮（它是在收到对手状态包那一刻才喊的），再看一会儿。
+  await waitFor(async () => {
+    const sa = await readStat(a.cdp);
+    if (sa?.hud?.banner) bannersSeen.add(sa.hud.banner);
+    return [...bannersSeen].some((t) => /ROUND 1/.test(t)) || null;
+  }, 6_000, 200);
+  const introBanners = [...bannersSeen];
+
+  const idA = ready.sa.myId;
+  const idB = ready.sb.myId;
+  const nameA = ready.sa.myName;
+  const nameB = ready.sa.peerNames[String(idB)] ?? "?";
+  // 只比水平距离：出生点记的是 y=1（脚底在落地前的位置），重置后还会再落一次。
+  const flatDist = (p, q) => Math.hypot(p[0] - q[0], p[2] - q[2]);
+  const spawnA = ready.sa.pos.slice();
+  const spawnYawA = ready.sa.figure.bodyYawDeg;
+  const introScoreboard = ready.sa.hud.scoreboard;
+
+  const locked = await clickToCapture(a.cdp);
+  if (locked) usedPointerLock = true;
+  console.log(`  指针锁定: ${locked}`);
+  await sleep(800);
+
+  // 打倒对方。一杀定胜负，所以这一轮按住打完就该结算。
+  const burst = await fireBurst(a.cdp, 16, { watch: b.cdp });
+
+  // 击杀事件要走一趋中继，等两端都记上再断言。
+  const scored = await waitFor(async () => {
+    const sa = await readStat(a.cdp);
+    const sb = await readStat(b.cdp);
+    const okA = (sa?.match?.scores?.[String(idA)]?.kills ?? 0) >= 1;
+    const okB = (sb?.match?.scores?.[String(idA)]?.kills ?? 0) >= 1;
+    return okA && okB ? { sa, sb } : null;
+  }, 12_000, 200);
+
+  const bannerA = scored?.sa?.hud?.banner ?? "";
+  const bannerB = scored?.sb?.hud?.banner ?? "";
+  const overScoresA = scored?.sa?.match?.scores ?? {};
+
+  // 人眼核对用：此时胜负横幅、最终比分、击杀提示同时在场，是唯一能一起看到的时刻。
+  // 击杀提示只挂 3.5 秒，所以必须在这里拍，不能等收尾那一张。
+  if (SHOT_DIR && scored) {
+    const img = await a.cdp.send("Page.captureScreenshot", { format: "png" });
+    const file = path.join(SHOT_DIR, "score-round-over.png");
+    fs.writeFileSync(file, Buffer.from(img.data, "base64"));
+    console.log(`  回合结算截图 ${file}`);
+  }
+
+  // 结算期间故意离开出生点：不这样的话，“重置把人送回出生点”本来就成立，验了等于没验。
+  await keyDown(a.cdp, "KeyD");
+  await mouseDelta(a.cdp, 260);
+  await sleep(500);
+  await keyUp(a.cdp, "KeyD");
+  await sleep(300);
+  const movedA = await readStat(a.cdp);
+  const movedDist = movedA ? flatDist(movedA.pos, spawnA) : 0;
+  const turnedDeg = movedA ? Math.abs(angleDiff(movedA.figure.bodyYawDeg, spawnYawA)) : 0;
+
+  // 等下一回合：比分清零、回合号 +1、人回到出生点
+  const reset = await waitFor(async () => {
+    const sa = await readStat(a.cdp);
+    const sb = await readStat(b.cdp);
+    return sa?.match?.round === 2 && sb?.match?.round === 2 ? { sa, sb } : null;
+  }, 25_000, 250);
+
+  const a2 = reset?.sa;
+  const b2 = reset?.sb;
+  const limit = ready.sa.match.scoreLimit;
+  const posBack = a2 ? flatDist(a2.pos, spawnA) : 999;
+  const yawBack = a2 ? Math.abs(angleDiff(a2.figure.bodyYawDeg, spawnYawA)) : 999;
+  const resetScoresA = a2?.match?.scores ?? {};
+
+  console.log("");
+  if (!scored) console.log("  ⚠ 没等到记分事件，后面的结论按“未发生”判定。");
+  if (!reset) console.log("  ⚠ 没等到下一回合，后面的结论按“未发生”判定。");
+  const results = [
+    ["分数上限来自网址参数", limit === 1, `scoreLimit=${limit}（网址 ?kills=1）`],
+    ["单人时提示等待对手，对手出现后喊回合开场",
+      introBanners.some((t) => /WAITING FOR OPPONENT/.test(t))
+      && introBanners.some((t) => /ROUND 1/.test(t)),
+      `先后见到：${introBanners.map((b) => `"${b}"`).join(" → ")}`],
+    ["记分板开局就列出双方且各为 0", introScoreboard.includes(nameA)
+      && introScoreboard.includes(nameB) && !/[1-9]/.test(introScoreboard),
+      `记分板 "${introScoreboard}"`],
+    ["击倒对方后自己记上一杀", (overScoresA[String(idA)]?.kills ?? 0) === 1,
+      `alpha(${nameA}) 记 ${overScoresA[String(idA)]?.kills ?? "-"} 杀，beta 最低血量 ${burst.minHealth}`],
+    ["被打的人记上一次阵亡", (overScoresA[String(idB)]?.deaths ?? 0) === 1,
+      `beta(${nameB}) 记 ${overScoresA[String(idB)]?.deaths ?? "-"} 次阵亡`],
+    ["两端对同一份比分看法一致",
+      (scored?.sa?.match?.scores?.[String(idA)]?.kills ?? -1)
+      === (scored?.sb?.match?.scores?.[String(idA)]?.kills ?? -2),
+      `alpha 眼中 ${nameA} ${scored?.sa?.match?.scores?.[String(idA)]?.kills ?? "-"} 杀 / beta 眼中`
+      + ` ${nameA} ${scored?.sb?.match?.scores?.[String(idA)]?.kills ?? "-"} 杀`],
+    ["胜负横幅按胜负区分", /YOU WIN/.test(bannerA) && /YOU LOSE/.test(bannerB),
+      `alpha "${bannerA}" / beta "${bannerB}"`],
+    ["横幅里带最终比分", bannerA.includes(nameA) && bannerA.includes(nameB), `"${bannerA}"`],
+    ["击杀提示出现在两端",
+      (scored?.sa?.hud?.feed ?? "").includes(nameB) && (scored?.sb?.hud?.feed ?? "").includes(nameB),
+      `alpha "${scored?.sa?.hud?.feed ?? ""}" / beta "${scored?.sb?.hud?.feed ?? ""}"`],
+    ["结算期间真的离开了出生点", movedDist > 0.5 || turnedDeg > 5,
+      `位移 ${movedDist.toFixed(2)} 米、转身 ${turnedDeg.toFixed(1)}°（这样“重置回出生点”才有意义）`],
+    ["下一回合比分清零", (resetScoresA[String(idA)]?.kills ?? -1) === 0
+      && (resetScoresA[String(idB)]?.deaths ?? -1) === 0,
+      `alpha ${resetScoresA[String(idA)]?.kills ?? "-"} 杀 / beta ${resetScoresA[String(idB)]?.deaths ?? "-"} 阵亡`],
+    ["回合号 +1 且两端同步进入", (a2?.match?.round ?? 0) === 2 && (b2?.match?.round ?? 0) === 2,
+      `alpha round=${a2?.match?.round ?? "-"} / beta round=${b2?.match?.round ?? "-"}`],
+    ["重置把人送回出生点", posBack < 0.6, `离出生点 ${posBack.toFixed(2)} 米`],
+    ["重置恢复开局朝向", yawBack < 3.0, `与开局朝向差 ${yawBack.toFixed(1)}°`],
+    ["重置后血量回满且复活", (a2?.health ?? 0) === 100, `血量 ${a2?.health ?? "-"}`],
+    ["下一回合横幅显示 ROUND 2", /ROUND 2/.test(a2?.hud?.banner ?? ""),
+      `横幅 "${a2?.hud?.banner ?? ""}"`],
   ];
   console.log("  结论:");
   for (const [label, ok, detail] of results) {

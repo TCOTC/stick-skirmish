@@ -45,6 +45,18 @@ extends CharacterBody3D
 ## 越持续扫射越难控制。水平方向**没有上限**：yaw 会绕圈，硬设一个限制反而奇怪。
 @export var recoil_yaw_deg: float = 0.6
 
+## 静止/首发时的散布半径（度）。子弹不再精确地打在准星那一点上。
+##
+## 散布是**跟着连发长**的：每发涨 spread_per_shot_deg，停火之后按
+## spread_recover_per_sec 回落。这样点射准、扫射散，压枪之外又多一层取舍。
+@export var spread_min_deg: float = 0.25
+## 连发散布的上限（度）。
+@export var spread_max_deg: float = 2.4
+## 每发让散布增长多少（度）。
+@export var spread_per_shot_deg: float = 0.45
+## 停火后散布的回落速度（度/秒）。
+@export var spread_recover_per_sec: float = 3.2
+
 ## 站立时相机相对角色的高度（米）。下蹲时会降到 crouch_cam_y。
 ##
 ## crouch_cam_y 不能取太矮：相机一低，角色在画面上就升，蹲下时头会正好压在准星上
@@ -62,6 +74,9 @@ extends CharacterBody3D
 ## 刚接管鼠标后这段时间内不开火：那一次点击是用来锁定指针的，不该顺手打出一发。
 const FIRE_BLOCK_AFTER_CAPTURE := 0.25
 
+## 默认/开局俯仰（弧度）。回合重置时回到这里。
+const START_PITCH := -0.22
+
 @onready var _arm: SpringArm3D = $SpringArm
 @onready var _camera: Camera3D = $SpringArm/Camera3D
 
@@ -72,7 +87,7 @@ const StickFigureScript := preload("res://scripts/stick_figure.gd")
 
 # 鼠标控制的**基准**俯仰。后坐力也写进这里（它要留在原地不回落），
 # 所以玩家得靠往下拖鼠标把准星压回来。正值为向上看。
-var _pitch: float = -0.22
+var _pitch: float = START_PITCH
 # 下蹲程度：0 = 站立，1 = 完全蹲下。
 var _crouch := 0.0
 var _gravity: float = 24.0
@@ -91,7 +106,13 @@ var _respawn_left := 0.0
 var shots_fired := 0
 # 出生点由 net.gd 在错开位置后告知（见 set_spawn_point）
 var _spawn_pos := Vector3.ZERO
+var _spawn_yaw := 0.0
 var _spawn_known := false
+# 当前的散布半径（度）。跟着连发增长、停火回落。
+var _spread := 0.0
+# 最后把自己打倒的人的编号与名字（用于记分与倒地提示）。
+var _killer_id := 0
+var _killer_name := ""
 
 ## 火柴人外观。样式（两套之一）由 net.gd 按进入房间的顺序决定。
 var figure: StickFigureScript = null
@@ -162,6 +183,8 @@ func _physics_process(delta: float) -> void:
 
 	_fire_cd = maxf(0.0, _fire_cd - delta)
 	_fire_block = maxf(0.0, _fire_block - delta)
+	# 散布回落。与生死无关，所以放在存活判断之前。
+	_spread = maxf(spread_min_deg, _spread - spread_recover_per_sec * delta)
 
 	# 这两件事与生死无关（倒地时枪口姿态也要正确收尾），所以放在存活判断之前。
 	_update_stance(active, delta)
@@ -231,6 +254,11 @@ func _apply_aim() -> void:
 ## 下蹲程度（0 站、1 蹲）。供自动化检查与网络同步读取。
 func crouch_amount() -> float:
 	return _crouch
+
+
+## 当前散布半径（度）。供自动化检查与快照读取。
+func spread_amount() -> float:
+	return _spread
 
 
 ## 开一发的后坐力：把准星往上抬一点、并左右随机偏一点，**而且都留在那里**。
@@ -331,20 +359,55 @@ func _try_fire() -> void:
 		point = hit["position"]
 
 	var muzzle := figure.muzzle_position()
-	figure.gun.flash()
-	Fx.tracer(muzzle, point, figure.limb_color())
-	if not hit.is_empty():
-		Fx.impact(hit["position"], hit["normal"], figure.limb_color())
+	var to_aim := point - muzzle
+	var distance := to_aim.length()
+	# 散布只改“这一发飞向哪”，起点仍是枪口。方向要**在广播之前**定下来，
+	# 否则本地看到的弹道与远端重放的不是同一条。
+	var shot_dir := _spread_direction(to_aim.normalized())
 
-	# 广播的是“枪口 + 朝向命中点的方向”，这样远端用同一条射线重放，
+	# 本地特效从枪口沿这一发真实方向算，撞到墙就停在墙上。
+	# 注意排除自己：枪口在身体前方，射线可能从自己的碰撞体里出发。
+	var shot_hit := _raycast(muzzle, shot_dir, [self])
+	var end := muzzle + shot_dir * distance
+	if not shot_hit.is_empty():
+		end = shot_hit["position"]
+
+	figure.gun.flash()
+	Sfx.play_local_shot()
+	Fx.tracer(muzzle, end, figure.limb_color())
+	if not shot_hit.is_empty():
+		Fx.impact(shot_hit["position"], shot_hit["normal"], figure.limb_color())
+		Sfx.play_impact(shot_hit["position"])
+
+	# 广播的是“枪口 + 实际飞行方向”，这样远端用同一条射线重放，
 	# 既不会有视差，也不会从自己的身体里穿出去。
 	if Net.connected:
-		Net.broadcast_fire(muzzle, (point - muzzle).normalized())
+		Net.broadcast_fire(muzzle, shot_dir)
 
-	# 抬准星放在最后：子弹要飞向**开火前**瞄的那个位置，
+	# 抬准星与加大散布放在最后：子弹要飞向**开火前**瞄的那个位置，
 	# 抬起来是留给下一发、以及玩家自己要压回来的那一份。
 	# 写在前面的话，连第一发都会偏掉一个后坐力步长。
 	_kick_recoil()
+	_spread = minf(spread_max_deg, _spread + spread_per_shot_deg)
+
+
+## 在方向周围取一个随机偏移，偏角最大为当前散布半径。
+##
+## 先绕一个与方向垂直的轴偏开一个角度，再绕方向自身转一圈：
+## 直接两次“随机欧拉角”会在锥体里分布不均，而半径取 sqrt(randf()) 才能保证
+## 单位面积上的概率相等（否则子弹会明显地向中心聚堆）。
+func _spread_direction(dir: Vector3) -> Vector3:
+	if _spread <= 0.0:
+		return dir
+	var cone := deg_to_rad(_spread * lerpf(1.0, crouch_recoil_scale, _crouch))
+	var axis := dir.cross(Vector3.UP)
+	if axis.length_squared() < 1e-6:
+		# 正好垂直向上/向下时 cross 退化，换一个参考轴
+		axis = dir.cross(Vector3.RIGHT)
+	if axis.length_squared() < 1e-6:
+		return dir
+	var angle := cone * sqrt(randf())
+	return dir.rotated(axis.normalized(), angle).rotated(dir, randf() * TAU)
 
 
 ## 收到别人开火。**由被打中的人判定命中**（本函数在被打者的客户端运行）。
@@ -352,7 +415,7 @@ func _try_fire() -> void:
 ## 为什么不用射击方判定：射击方手上的目标位置是 20 Hz 同步过来的、有延迟的旧数据，
 ## 8 m/s 时误差可达 40 厘米；由被打者用**自己当前位置**判定才准。
 ## 代价是打人的人可能看到“明明打中却掉血”，这是没有延迟补偿时的必然取舍。
-func receive_shot(origin: Vector3, direction: Vector3, damage: int) -> bool:
+func receive_shot(origin: Vector3, direction: Vector3, damage: int, shooter_id := 0) -> bool:
 	if not alive:
 		return false
 	var hit := _raycast(origin, direction, [])
@@ -361,14 +424,22 @@ func receive_shot(origin: Vector3, direction: Vector3, damage: int) -> bool:
 	# 只认打中自己的身体。被掩体或别人挡住时，第一个命中就不是我。
 	if hit["collider"] != self:
 		return false
-	take_damage(damage)
+	take_damage(damage, shooter_id)
 	return true
 
 
-func take_damage(amount: int) -> void:
+func take_damage(amount: int, killer_id := 0) -> void:
 	if not alive:
 		return
 	health = maxi(0, health - amount)
+	_killer_id = killer_id
+	_killer_name = Net.player_name(killer_id) if killer_id > 0 else ""
+	# 受伤的“手感”全在这一帧：红闪 + 短音 + 血条。没有延迟补偿，
+	# 所以这几件事是玩家判断“我挨打了”的唯一依据。
+	var hud := _hud()
+	if hud != null:
+		hud.call("damage_flash", 0.32)
+	Sfx.play_hurt()
 	_update_hud()
 	if Net.connected:
 		Net.broadcast_health(health)
@@ -376,9 +447,10 @@ func take_damage(amount: int) -> void:
 		_die()
 
 
-## 让 net.gd 在错开出生位置之后告知出生点，重生时用。
+## 让 net.gd 在错开出生位置之后告知出生点与朝向，重生时用。
 func set_spawn_point(pos: Vector3) -> void:
 	_spawn_pos = pos
+	_spawn_yaw = rotation.y
 	_spawn_known = true
 
 
@@ -389,6 +461,13 @@ func _die() -> void:
 	if figure != null:
 		# 侧倒：绕 X 倒下去（figure 的 rotation.y 由 _update_lean 改，x 是空闲的）
 		figure.rotation.x = deg_to_rad(85.0)
+	Sfx.play_death()
+	var hud := _hud()
+	if hud != null:
+		hud.call("damage_flash", 0.55)
+	# 记分交给 Match：它是唯一维护比分与回合的地方。这里只上报**被打者的认定**，
+	# 开枪的人是谁由击杀事件告诉所有人（见 match.gd 的文件头）。
+	Match.report_local_death(_killer_id)
 	print("[player] 倒地")
 
 
@@ -409,11 +488,27 @@ func respawn() -> void:
 	velocity = Vector3.ZERO
 	if figure != null:
 		figure.rotation.x = 0.0
+	Sfx.play_spawn()
 	_update_hud()
 	_set_hud_down(0.0)
 	if Net.connected:
 		Net.broadcast_health(health)
 	print("[player] 重生 at ", global_position)
+
+
+## 开新回合时把自己摆回开局状态：位置、朝向、准星、散布都归位。
+##
+## 与 respawn() 的区别在于**朝向**：局中被打倒重生时不该掰回我的准星（那会让人
+## 刚重生就被动转向），而回合开始时两边都回到面对面的初始姿态才公平。
+func reset_for_round() -> void:
+	respawn()
+	rotation.y = _spawn_yaw
+	_pitch = START_PITCH
+	_spread = spread_min_deg
+	_apply_aim()
+	if figure != null:
+		figure.rotation.y = 0.0
+		figure.aim_pitch = aim_pitch()
 
 
 ## 一次射线查询。exclude 传自己要排除的节点。
@@ -449,7 +544,7 @@ func _update_hud() -> void:
 func _set_hud_down(seconds: float) -> void:
 	var hud := _hud()
 	if hud != null:
-		hud.call("set_down", seconds)
+		hud.call("set_down", seconds, _killer_name)
 
 
 func _notification(what: int) -> void:
