@@ -135,8 +135,7 @@ var _spawn_known := false
 ## 自己维护之后规则很简单，而且不怕丢事件：
 ##   - 只有**已经接管鼠标之后**收到的左键按下才算“按住”→ 进游戏那一下永远不会开火
 ##   - 接管鼠标的那一刻、丢失指针、窗口失焦、左键松开，都算“松开”
-##   - 指针移动事件里带着“当前按下了哪些键”的掩码，掩码为 0 也算“松开”
-##     （触控板几乎总会有移动，所以这条能救“局中丢掉松开事件”的情况）
+##   - 局中丢失松开事件时，由**浏览器侧**的判定补上（见 `_dom_trigger_released()`）
 var _trigger_held := false
 ## “点了一下”产生的那一发还剩多久（秒）。
 var _trigger_pulse := 0.0
@@ -200,6 +199,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 				_trigger_held = true
 				_trigger_pulse = TRIGGER_PULSE_TIME
+				# 告诉页面“这一次按下是什么时候”，兜底判定要用它排除陈旧的抬起记录。
+				_dom_mark_press()
 			# 网页上"锁指针"这一步交给注入的脚本做，这里刻意不碰。
 			# 原因：requestFullscreen 和 requestPointerLock 都由浏览器要求"必须在用户手势里发出"，
 			# 两者同时发出会打架——全屏切换过程中发出的锁定请求偶尔被拒，
@@ -661,24 +662,37 @@ func _release_trigger() -> void:
 	Input.action_release("fire")
 
 
-## 问浏览器：左键现在是不是还被按着。**独立于 Godot 自己的事件流**。
+## 问问浏览器：这次按下是不是已经结束了。**独立于 Godot 自己的事件流**。
 ##
 ## 为什么需要它：浏览器会把“点击进入游戏”那次的 mouseup 吞掉（Mac 触控板 + 全屏过渡），
 ## Godot 的动作状态只由事件驱动，于是永远停在“按下”而每帧开火。光靠 Godot 的事件
 ## 发现不了这件事（移动事件的按键掩码也是它自己填的）。
-## 注入脚本（export_presets.cfg 的 head_include）因此维护了两个计数：左键按下与抬起各一个，
-## 并且会在移动事件里用浏览器的 `e.buttons` 自我纠正（即使 mouseup 丢了，
-## 下一次移动也能把“其实已经抬起”告诉页面）。这里读的就是这两个计数。
+##
+## 页面的判定（`export_presets.cfg` 的 head_include）是这样的：
+##
+##     本次按下之后，浏览器是不是报过“左键已抬起”，而且那次抬起已经持续了一小会儿
+##
+## 三个条件必须同时成立，每个都在防一类误判：
+##   - `!view.__fireBtn`：`pointerdown/up/cancel/blur` 与 `pointermove` 一起维护的**绝对状态**
+##     （绝对而不是计数：计数会在丢了事件的组合下漂移，而且漂了就再也回不来）
+##   - `__fireUpAt > __firePressAt`：只认发生在**本次按下之后**的抬起。否则页面自己丢了
+##     pointerdown 时，一条陈旧的“抬起”记录会把真实的按住误判成松开
+##   - 已持续 150 毫秒：按住途中偶然一个报成 0 的移动事件不会把开火掐断
 ##
 ## 只在“我们自己认为按住”时才调用（每帧一次 JavaScriptBridge.eval，开销可忽略）。
-## 若注入脚本不存在（旧的导出产物），表达式返回 1，即“仍按着”——退回到原有行为，不会误报。
+## 注入脚本不存在（旧的导出产物）时返回 0，即“没结束”——退回原有行为，不会误报。
 func _dom_trigger_released() -> bool:
 	if not OS.has_feature("web"):
 		return false
-	var delta := int(JavaScriptBridge.eval(
-		"typeof window.__fireDown==='number' ? (window.__fireDown-window.__fireUp) : 1"
-	))
-	return delta <= 0
+	return int(JavaScriptBridge.eval(
+		"typeof window.__fireAnswer==='function' ? window.__fireAnswer() : 0"
+	)) == 1
+
+
+## 把“这一次按下”的时刻告诉页面。页面的兜底判定要靠它区分“本次的抬起”与陈旧的抬起记录。
+func _dom_mark_press() -> void:
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("window.__firePressAt=performance.now()")
 
 
 ## 供自动化检查读取：自己维护的扳机状态与 Godot 自己那份的对照。

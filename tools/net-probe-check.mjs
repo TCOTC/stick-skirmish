@@ -611,18 +611,45 @@ try {
   }
   console.log("");
 
-  if (MODE === "room") {
-    await checkRoom();
-  } else if (MODE === "walk") {
-    await checkWalk();
-  } else if (MODE === "shoot") {
-    await checkShoot();
-  } else if (MODE === "score") {
-    await checkScore();
-  } else if (MODE === "fire") {
-    await checkFire();
+  // 先问页面一句：注入脚本（export_presets.cfg 的 head_include）在不在。
+  //
+  // 它负责“点画面 → 全屏 + 锁定指针”，是所有模式的共同前提。而它一旦有语法错误，
+  // **整段脚本一行都不执行**——症状是点画面完全没反应，而除了真机试玩没人会发现
+  // （上次就是因为少了一个未闭合的括号把它带进了产物）。所以这一步单独断言。
+  //
+  // 判据故意写成“任一个由它定义的全局变量存在”，而不是盯死某一个名字：
+  // 这样换实现时不必同步改这里，而“整段没跑”仍然会被抓住。
+  const injected = await waitFor(
+    async () => {
+      const probe = await instances[0].cdp.evaluate(
+        "typeof window.__fireAnswer==='function' || typeof window.__fireDown==='number'",
+      );
+      return probe === true;
+    }, 8000, 300,
+  );
+  if (injected) {
+    console.log("  注入脚本已生效（点画面可全屏 + 锁定指针）");
   } else {
+    console.error("  ✗ 注入脚本没生效（window.__fireAnswer 不是函数）：点画面无法全屏/锁定。");
+    console.error("    检查 export_presets.cfg 的 html/head_include —— 有语法错误就会整段不执行。");
+    process.exitCode = 1;
+  }
+
+  // 注入脚本没生效时不必再跑模式检查：后面每一项都依赖指针锁定与键盘输入。
+  if (MODE === "room" && injected) {
+    await checkRoom();
+  } else if (MODE === "walk" && injected) {
+    await checkWalk();
+  } else if (MODE === "shoot" && injected) {
+    await checkShoot();
+  } else if (MODE === "score" && injected) {
+    await checkScore();
+  } else if (MODE === "fire" && injected) {
+    await checkFire();
+  } else if (MODE === "probe") {
     await checkProbe();
+  } else if (!injected) {
+    console.log("  已跳过模式检查（前提不成立）。");
   }
 
   // 可选：把每个实例的画面存下来，供人眼核对（特效、血条、枪的形状这类只能看）
@@ -1281,18 +1308,21 @@ async function checkScore() {
 /**
  * 开火扳机模式：验证“浏览器吞掉 mouseup”不会让角色一直开火。
  *
- * 【为什么要单独测】Mac 触控板上有一个稳定可重现的故障：点一下进入游戏之后就一直开火，
+ * 【为何要单独测】Mac 触控板上有一个稳定可重现的故障：点一下进入游戏之后就一直开火，
  * 即使早已松开。成因是那次点击触发了全屏 + 指针锁定，而**松开事件被吞掉了**——
  * Godot 的动作状态只由事件驱动，丢了 mouseup 就永远停在“按下”。
  *
  * 从 Windows 无法重现 Mac 上那次事件丢失，但可以用 CDP 造出**同样的局面**：
- * 发一个 `mousePressed`、**永远不发 `mouseReleased`**。这就是本模式的第一项断言。
+ * 发一个 `mousePressed`、**永远不发 `mouseReleased`**。
  *
- * 四项断言，各自守一件事：
+ * 十项断言，各自守一件事：
  *   1. 进游戏那一下（松开被吞）不会开火 —— 直接对应报障的那个症状
- *   2. 按住时移动鼠标仍在开火 —— 给“移动掩码”那个兜底上保险，它不能把真按住当成松开
- *   3. 正常点一下能打出一发，松手后停下 —— 不能为了修故障把点射弄坏
- *   4. 局中丢掉松开事件时，之后的鼠标移动能把它救回来 —— 兜底路径真的有效
+ *   2. 按住时移动鼠标仍在开火 —— 给浏览器的兜底上保险，它不能把真按住当成松开
+ *   3. 松手之后停下、点一下仍能打出一发 —— 不能为了修故障把点射弄坏
+ *   4. 局中丢掉松开事件时，之后的鼠标移动能救回来 —— 兜底路径真的有效
+ *   5. 按住并移动、乃至按住途中出现一次“按钮已抬起”的误报之后，**再按仍能射击**
+ *      —— 守着一个真实发生过的缺陷：“按下/抬起”两个计数求差值会漂移，
+ *      漂成负数之后每一次按下都被同一帧判为松开（用户报障：按住并移动后就不能射击了）
  */
 async function checkFire() {
   const cdp = instances[0].cdp;
@@ -1327,12 +1357,28 @@ async function checkFire() {
   });
 
   // --- 1. 进入游戏：按下之后永不松开（复现被吞掉的 mouseup）---
-  await pressOnly();
-  const locked = await waitFor(
-    async () => (await cdp.evaluate("!!document.pointerLockElement")) || null, 6000, 200,
-  );
+  //
+  // 指针锁定要重试：全屏与锁定都在这一次点击的手势里发起，两者并发时锁定请求**偶尔被拒**
+  // （README 里记过这个竞态，真实玩家遇到时会再点一下）。重试时仍然**不发 mouseReleased**，
+  // 所以“按下早于接管、松开永远不来”这个前提始终成立。
+  let locked = false;
+  for (let attempt = 0; attempt < 4 && !locked; attempt++) {
+    await pressOnly();
+    locked = !!(await waitFor(
+      async () => (await cdp.evaluate("!!document.pointerLockElement")) || null, 2500, 200,
+    ));
+    if (!locked) console.log(`  第 ${attempt + 1} 次点击没拿到指针锁定，重试…`);
+  }
   if (locked) usedPointerLock = true;
   console.log(`  指针锁定: ${locked}`);
+  if (!locked) {
+    const diag = await cdp.evaluate(
+      "JSON.stringify({full: !!document.fullscreenElement,"
+      + " answer: typeof window.__fireAnswer, btn: typeof window.__fireBtn})",
+    );
+    console.log(`  诊断: ${diag}`);
+    process.exitCode = 1;
+  }
   // 等过 FIRE_BLOCK_AFTER_CAPTURE（0.25 秒）再加上足够长的时间，让“一直开火”暴露出来
   await sleep(1800);
   const afterEnter = await readStat(cdp);
@@ -1390,6 +1436,57 @@ async function checkFire() {
   await sleep(700);
   const settledShots = (await readStat(cdp))?.shots ?? 0;
 
+  // --- 5. 按住的同时移动（含中途一次“按钮已抬起”的误报），之后再按必须还能射击 ---
+  //
+  // 这一项守着一个**曾经真实存在**的缺陷：早先用“按下 / 抬起”两个计数求差值判断，
+  // 而按住途中的一个 buttons=0 的移动会让差值归零、随后真正的抬起又让它变成 -1，
+  // 于是此后每一次按下都被同一帧判为“已松开”——再也射不出来。
+  // 用户报障的原话就是“按住触控板的同时移动位置，下次再按触控板就不能射击了”。
+  await pressOnly();
+  await waitFor(async () => {
+    const s = await readStat(cdp);
+    return (s?.trigger?.held ?? false) ? s : null;
+  }, 3000, 100);
+  const beforeAim = (await readStat(cdp))?.shots ?? 0;
+  // 按住 + 移动（buttons = 1）
+  for (let i = 0; i < 5; i++) {
+    await move(420 + i * 22, 1);
+    await sleep(70);
+  }
+  const aiming = await readStat(cdp);
+  const aimingShots = aiming?.shots ?? 0;
+  const aimingHeld = aiming?.trigger?.held ?? false;
+  // 中途来一个“按钮已抬起”的误报，再继续按住移动（模拟触控板上的抖动）
+  await move(560, 0);
+  await sleep(60);
+  for (let i = 0; i < 5; i++) {
+    await move(580 + i * 22, 1);
+    await sleep(70);
+  }
+  const afterJitter = await readStat(cdp);
+  const jitterHeld = afterJitter?.trigger?.held ?? false;
+  const jitterShots = afterJitter?.shots ?? 0;
+  await cdpFire(cdp, false);
+  await sleep(600);
+
+  // 关键的一步：松手之后**再按一次**，必须还能打出子弹
+  const beforeSecond = (await readStat(cdp))?.shots ?? 0;
+  await cdpFire(cdp, true);
+  await sleep(260);
+  const secondHeld = (await readStat(cdp))?.trigger?.held ?? false;
+  await sleep(200);
+  const secondShots = (await readStat(cdp))?.shots ?? 0;
+  await cdpFire(cdp, false);
+  await sleep(500);
+
+  // 再按一次，确认不是“刚好蒙对一次”
+  const beforeThird = (await readStat(cdp))?.shots ?? 0;
+  await cdpFire(cdp, true);
+  await sleep(320);
+  const thirdShots = (await readStat(cdp))?.shots ?? 0;
+  await cdpFire(cdp, false);
+  await sleep(400);
+
   console.log("");
   const results = [
     ["进游戏那一下（松开被吞掉）不开火", enterShots === 0,
@@ -1404,6 +1501,14 @@ async function checkFire() {
       `扳机 held=${stuckHeld}，已开火 ${stuckShots} 发`],
     ["之后的鼠标移动把扳机救回来", recoveredHeld === false && settledShots - recoveredShots <= 1,
       `移动后 held=${recoveredHeld}，再等 700 毫秒多打 ${settledShots - recoveredShots} 发`],
+    ["按住并移动时一直在开火", aimingShots > beforeAim && aimingHeld,
+      `瞄准期间 ${beforeAim} → ${aimingShots} 发，held=${aimingHeld}`],
+    ["按住途中一次“按钮已抬起”的误报不会掐掉开火", jitterHeld && jitterShots > aimingShots,
+      `误报之后仍 held=${jitterHeld}，${aimingShots} → ${jitterShots} 发`],
+    ["松手后再按仍能射击（用户报障的那一项）", secondHeld && secondShots - beforeSecond >= 1,
+      `再按一次 held=${secondHeld}，多打 ${secondShots - beforeSecond} 发`],
+    ["再按第三次仍然能射击（不是蒙对一次）", thirdShots - beforeThird >= 1,
+      `第三次多打 ${thirdShots - beforeThird} 发`],
   ];
   console.log("  结论:");
   for (const [label, ok, detail] of results) {

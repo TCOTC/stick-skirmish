@@ -128,6 +128,13 @@ powershell -ExecutionPolicy Bypass -File tools/free-cursor.ps1
 
 测试脚本自己会起守卫（见下方「鼠标不会被开发过程困住」），不需要手动调用。
 
+想知道“页面里到底有什么”（注入脚本有没有跑、有没有报错）就求值问它：
+
+```powershell
+node tools/dev-peek.mjs https://127.0.0.1:8001 "typeof window.__fireAnswer"
+node tools/dev-peek.mjs https://127.0.0.1:8001   # 不带表达式就查一组默认的
+```
+
 ## 验证手段
 
 **AI 能看画面**：`node tools/shot.mjs` 会驱动无头 Chrome 打开网页版并截图，
@@ -191,11 +198,20 @@ CDP 测试的两个坑：
   Godot 的动作状态只由事件驱动，于是 `Input.is_action_pressed("fire")` 永远停在“按下”→
   一直开火。现在开火扳机（`player._trigger_held`）自己维护：
   **只有已经接管鼠标之后的左键按下才算按住**，接管/交还鼠标、失焦、松开都算松开。
-  局中丢失松开则由**浏览器侧**的两个计数救回（`export_presets.cfg` 的 head_include
-  维护 `__fireDown/__fireUp`，并在 pointermove 里用 `e.buttons` 自我纠正）。
+  局中丢失松开由**浏览器侧**的 `__fireAnswer()` 补上（`export_presets.cfg` 的 head_include），
+  它要求三件事同时成立：`!__fireBtn`（绝对状态）、`__fireUpAt > __firePressAt`（是本次按下
+  **之后**的抢起，排除陈旧记录）、且已持续 150 毫秒（途中抖一下不会把开火掉掉）。
+- **绝对状态而不是计数：计数差值会漂移，而且漂了就回不来。** 曾经用“按下数 − 抬起数”，
+  按住途中只要有一个移动事件把 `buttons` 报成 0，差值就归零；随后的真正抬起再让它变成 `-1`
+  ——此后再也不可能为正，每次按下都在同一帧被判成“已松开”。症状：**按住触控板并移动之后，
+  下次再按就不能射击**。任何“可累积的量”都会重犯这个错。
 - **不要用“移动事件的按键掩码为 0”当松开信号**：实测 Godot 网页版把移动事件的掩码
   填成**它自己**记录的状态，而不是浏览器的 `e.buttons`，丢了 mouseup 时它一直是 1，
   这条启发式永远不会触发（`--fire` 的第 6 项就是量它的）。
+- **注入脚本（`html/head_include`）有语法错误时会整段不执行**，症状不是某处报错，
+  而是“点画面完全没反应”（全屏与锁指针一起失效）。它逃过了上一轮的 commit，
+  而除了真机试玩没人会发现。现在每次测试开场都先断言 `typeof window.__fireAnswer`，
+  以及配套的诊断工具 `node tools/dev-peek.mjs <url> <表达式…>`（求值并打印控制台/异常）。
 - **`Input.action_release` 能清掉“设备驱动”的动作状态**（实测：`mousePressed` 后又
   调它，`is_action_pressed` 变 false），所以接管鼠标时顺手清一次也有效。
 - **键盘只在鼠标锁定时生效**，判据是 `Input.mouse_mode == MOUSE_MODE_CAPTURED`。
