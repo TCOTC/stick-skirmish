@@ -415,9 +415,12 @@ func _try_fire() -> void:
 	figure.gun.flash()
 	Sfx.play_local_shot()
 	_shake = maxf(_shake, fire_shake)
-	Fx.tracer(muzzle, end, figure.limb_color())
+	# 弹道与弹着点用**墨水色**而不是肢体颜色：肢体现在是纸白，
+	# 拿它画线会得到一串看不见的白线（改黑白风格时最容易漏的地方）。
+	var ink := figure.ink_color()
+	Fx.tracer(muzzle, end, ink)
 	if not shot_hit.is_empty():
-		Fx.impact(shot_hit["position"], shot_hit["normal"], figure.limb_color())
+		Fx.impact(shot_hit["position"], shot_hit["normal"], ink)
 		Sfx.play_impact(shot_hit["position"])
 
 	# 广播的是“枪口 + 实际飞行方向”，这样远端用同一条射线重放，
@@ -511,7 +514,7 @@ func _die() -> void:
 	if hud != null:
 		hud.call("damage_flash", 0.55)
 	if figure != null:
-		Fx.burst(global_position + Vector3(0.0, 1.1, 0.0), figure.limb_color())
+		Fx.burst(global_position + Vector3(0.0, 1.1, 0.0), figure.ink_color())
 	# 记分交给 Match：它是唯一维护比分与回合的地方。这里只上报**被打者的认定**，
 	# 开枪的人是谁由击杀事件告诉所有人（见 match.gd 的文件头）。
 	Match.report_local_death(_killer_id)

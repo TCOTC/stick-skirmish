@@ -6,10 +6,13 @@
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
-background_color = Color(0.05, 0.06, 0.09, 1)
+; 纸白背景。整套黑白手绘风格里，背景不是“天空”而是那张纸。
+background_color = Color(0.965, 0.953, 0.925, 1)
 ambient_light_source = 2
-ambient_light_color = Color(0.55, 0.62, 0.78, 1)
-ambient_light_energy = 0.7
+; 白色环境光 + 白色太阳：明暗差别只由朝向产生，没有色偏（黑白风格的前提）。
+; 环境光取 0.75 而不是更高，是为了让背光面落在浅灰而不是纯白——那点灰就是“铅笔的排线”。
+ambient_light_color = Color(1, 1, 1, 1)
+ambient_light_energy = 0.75
 tonemap_mode = 2
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_1"]
@@ -23,7 +26,11 @@ environment = SubResource("Environment_1")
 
 [node name="Sun" type="DirectionalLight3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 0.643, -0.766, 0, 0.766, 0.643, 0, 14, 0)
-shadow_enabled = true
+light_color = Color(1, 1, 1, 1)
+light_energy = 0.5
+; 投影关掉：黑白线稿要的是平涂 + 墨线，硬阴影会在白墙上压出一片灰，
+; 与“画上去的线”不是一回事。
+shadow_enabled = false
 
 [node name="Arena" type="Node3D" parent="."]
 script = ExtResource("1_arena")

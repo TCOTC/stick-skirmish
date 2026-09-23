@@ -10,6 +10,8 @@ extends CanvasLayer
 ## 它只是“显示层”：谁打倒了谁、回合结没结束都属于 Match 的职责，
 ## 这里只提供 `scoreboard` / `banner` / `feed` 这些幂等的写接口。
 
+const Ink := preload("res://scripts/ink.gd")
+
 const BAR_WIDTH := 240.0
 const BAR_HEIGHT := 16.0
 
@@ -32,7 +34,8 @@ const CROSS_BASE_GAP := 4.0
 const CROSS_GAP_PER_DEG := 3.2
 const CROSS_LEN := 6.0
 const CROSS_THICK := 1.5
-const CROSS_COLOR := Color(0.23, 0.88, 1.0, 0.85)
+## 墨色准星。旧配色是青色，黑白风格下准星也必须是墨：它是画在纸上的标线。
+const CROSS_COLOR := Color(Ink.INK.r, Ink.INK.g, Ink.INK.b, 0.9)
 
 var _bar_fill: ColorRect = null
 var _bar_label: Label = null
@@ -95,12 +98,13 @@ func _process(delta: float) -> void:
 
 
 ## 更新自己的血量。fraction 会做 0..1 限制，所以传入超范围的数也不会画歪。
+##
+## 长短就是唯一的读数（底色是墨、填充是纸，比的是“还剩多少白”）。
+## 不再按血量调色：黑白风格里没有色相可用，而两个玩家同屏时各自的剩血都得读得出来。
 func set_health(hp: int, max_hp: int) -> void:
 	if _bar_fill == null:
 		return
 	var frac := clampf(float(hp) / maxf(1.0, float(max_hp)), 0.0, 1.0)
-	# 满血绿、空血红，中间连续过渡
-	_bar_fill.color = Color(0.30 + 0.65 * (1.0 - frac), 0.25 + 0.60 * frac, 0.25)
 	_bar_fill.offset_right = 2.0 + (BAR_WIDTH - 4.0) * frac
 	if _bar_label != null:
 		_bar_label.text = "HP %d / %d" % [maxi(hp, 0), max_hp]
@@ -112,7 +116,7 @@ func damage_flash(strength := 0.32) -> void:
 		return
 	if _flash_tween != null and _flash_tween.is_valid():
 		_flash_tween.kill()
-	_flash.color = Color(0.85, 0.10, 0.12, clampf(strength, 0.0, 1.0))
+	_flash.color = Color(Ink.INK.r, Ink.INK.g, Ink.INK.b, clampf(strength, 0.0, 1.0))
 	_flash_tween = create_tween()
 	_flash_tween.tween_property(_flash, "color:a", 0.0, FLASH_TIME)
 
@@ -125,9 +129,7 @@ func hitmarker(kill := false) -> void:
 	if kill:
 		_kill_count += 1
 	_hitmarker.text = "X" if kill else "x"
-	_hitmarker.add_theme_color_override(
-		"font_color", Color(1.0, 0.32, 0.28) if kill else Color(1.0, 0.95, 0.4)
-	)
+	_hitmarker.add_theme_color_override("font_color", Ink.INK)
 	_hitmarker.visible = true
 	_hitmarker_left = KILLMARKER_TIME if kill else HITMARKER_TIME
 	set_process(true)
@@ -177,13 +179,14 @@ func scoreboard(title: String, rows: Array) -> void:
 		var label := _score_rows[i]
 		# rpad 让两行的数字对齐：默认字体不是等宽，用空格排版就得先补齐名字长度。
 		label.text = "%s %2d / %d" % [str(row["name"]).rpad(6), int(row["kills"]), int(row["deaths"])]
+		# 自己那行用墨黑、对手用石墨灰：黑白里靠深浅区分主次，而不是色相
 		label.add_theme_color_override(
-			"font_color", Color(0.72, 0.94, 1.0) if bool(row["me"]) else Color(0.62, 0.66, 0.74)
+			"font_color", Ink.INK if bool(row["me"]) else Ink.GRAPHITE
 		)
 
 
 ## 胜负 / 回合横幅。main 为空表示收起。color 是主标题颜色。
-func banner(main: String, sub: String, color := Color(0.72, 0.94, 1.0)) -> void:
+func banner(main: String, sub: String, color := Ink.INK) -> void:
 	if _banner_box == null:
 		return
 	if main.is_empty():
@@ -203,7 +206,7 @@ func feed(text: String) -> void:
 	var label := Label.new()
 	label.text = text
 	label.add_theme_font_size_override("font_size", 15)
-	label.add_theme_color_override("font_color", Color(0.92, 0.80, 0.55))
+	label.add_theme_color_override("font_color", Ink.INK)
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	_feed_box.add_child(label)
 	# 新的一条排在最上面
@@ -296,7 +299,8 @@ func hint_text() -> String:
 func _build_health_bar() -> void:
 	var bg := ColorRect.new()
 	bg.name = "HealthBar"
-	bg.color = Color(0.05, 0.06, 0.08, 0.78)
+	# 墨色底 + 纸白填充：这就是血条的“描边”，不需要另加边框控件
+	bg.color = Color(Ink.INK.r, Ink.INK.g, Ink.INK.b, 0.86)
 	# 锚在左下角：anchor_top/bottom 用 1.0，偏移相对底边往上量
 	bg.anchor_top = 1.0
 	bg.anchor_bottom = 1.0
@@ -315,7 +319,7 @@ func _build_health_bar() -> void:
 	_bar_fill.offset_top = 2.0
 	_bar_fill.offset_right = 2.0 + (BAR_WIDTH - 4.0)
 	_bar_fill.offset_bottom = -2.0
-	_bar_fill.color = Color(0.30, 0.85, 0.25)
+	_bar_fill.color = Ink.PAPER
 	bg.add_child(_bar_fill)
 
 	_bar_label = Label.new()
@@ -323,9 +327,10 @@ func _build_health_bar() -> void:
 	_bar_label.anchor_top = 1.0
 	_bar_label.anchor_bottom = 1.0
 	_bar_label.offset_left = 24.0
-	_bar_label.offset_top = -66.0
-	_bar_label.offset_bottom = -48.0
-	_bar_label.add_theme_color_override("font_color", Color(0.82, 0.88, 0.95))
+	# 与血条之间留出间距：贴在边上时文字下缘会压在黒框上（实测过）
+	_bar_label.offset_top = -72.0
+	_bar_label.offset_bottom = -50.0
+	_bar_label.add_theme_color_override("font_color", Ink.INK)
 	add_child(_bar_label)
 
 
@@ -342,7 +347,7 @@ func _build_hitmarker() -> void:
 	_hitmarker.offset_top = -8.0
 	_hitmarker.offset_right = 24.0
 	_hitmarker.offset_bottom = 20.0
-	_hitmarker.add_theme_color_override("font_color", Color(1.0, 0.95, 0.4))
+	_hitmarker.add_theme_color_override("font_color", Ink.INK)
 	_hitmarker.visible = false
 	add_child(_hitmarker)
 
@@ -359,7 +364,7 @@ func _build_down_label() -> void:
 	_down.offset_right = 110.0
 	_down.offset_bottom = 100.0
 	_down.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_down.add_theme_color_override("font_color", Color(1.0, 0.35, 0.3))
+	_down.add_theme_color_override("font_color", Ink.INK)
 	_down.visible = false
 	add_child(_down)
 
@@ -379,7 +384,7 @@ func _build_scoreboard() -> void:
 	_score_title.name = "Title"
 	_score_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	_score_title.add_theme_font_size_override("font_size", 13)
-	_score_title.add_theme_color_override("font_color", Color(0.55, 0.60, 0.68))
+	_score_title.add_theme_color_override("font_color", Ink.GRAPHITE)
 	_score_box.add_child(_score_title)
 
 
@@ -406,7 +411,7 @@ func _build_banner() -> void:
 	_banner_sub.name = "Sub"
 	_banner_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_banner_sub.add_theme_font_size_override("font_size", 20)
-	_banner_sub.add_theme_color_override("font_color", Color(0.82, 0.88, 0.95))
+	_banner_sub.add_theme_color_override("font_color", Ink.GRAPHITE)
 	_banner_box.add_child(_banner_sub)
 
 
@@ -427,7 +432,7 @@ func _build_flash() -> void:
 	_flash.name = "DamageFlash"
 	_flash.anchor_right = 1.0
 	_flash.anchor_bottom = 1.0
-	_flash.color = Color(0.85, 0.10, 0.12, 0.0)
+	_flash.color = Color(Ink.INK.r, Ink.INK.g, Ink.INK.b, 0.0)
 	# 铺满整屏的控件若参与 GUI 输入，会把点击吞掉（接管鼠标也要靠那一下点击）。
 	_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_flash)
@@ -508,7 +513,7 @@ func _build_hint() -> void:
 	_hint_main.text = "CLICK TO PLAY"
 	_hint_main.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hint_main.add_theme_font_size_override("font_size", 26)
-	_hint_main.add_theme_color_override("font_color", Color(0.85, 0.94, 1.0))
+	_hint_main.add_theme_color_override("font_color", Ink.INK)
 	_hint_box.add_child(_hint_main)
 
 	_hint_sub = Label.new()
@@ -516,5 +521,5 @@ func _build_hint() -> void:
 	_hint_sub.text = "MOUSE look   WASD move   SHIFT crouch   LMB fire   ESC release"
 	_hint_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hint_sub.add_theme_font_size_override("font_size", 14)
-	_hint_sub.add_theme_color_override("font_color", Color(0.66, 0.74, 0.84))
+	_hint_sub.add_theme_color_override("font_color", Ink.GRAPHITE)
 	_hint_box.add_child(_hint_sub)

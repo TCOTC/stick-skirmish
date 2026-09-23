@@ -2,8 +2,19 @@ class_name StickFigure
 extends Node3D
 ## 火柴人角色：Skeleton3D 骨骼 + BoneAttachment3D 挂网格 + 程序化步态动画。
 ##
-## 为什么用真正的 Skeleton3D 而不是一堆 Node3D 关节：每根骨头由 BoneAttachment3D 挂一个
-## 圆柱网格，旋转骨骼就是摆动肢体。这是 Godot 里骨骼绑定的正规做法，将来换成导入的模型
+## 【外观：有体积的“火柴棍”】肢体用**胶囊**而不是细杆，半径从 1.7 毫米级的“线”
+## 提到 3~4 厘米（直径 6~8 厘米）——圆柱只能给出“细线”，胶囊两端是半球，
+## 看起来像根粗短的火柴棍，而且不需要额外加关节球去填端面的缝。
+## 每个部件外面套一圈墨线（反壳描边，见 ink.gd），整个角色就是一幅线描。
+##
+## 【黑白里怎么区分两个人】旧配色靠橙/青的色相差，去色之后两者都是白，必须换一套区分方式：
+##   - ember：头是**实心墨块**（白眼睛），肢体粗一点
+##   - frost：头是纸白带墨线（黑眼睛），胸前多一道墨带，肢体细一点
+## 另外两人的“墨水色”也不一样（墨黑 / 石墨灰），所以能分辨弹道是谁打出来的。
+## 这三条都是**不用色相**就能看到的差别，tools/art-check.gd 会断言它们在灰度下可区分。
+##
+## 为什么用真正的 Skeleton3D 而不是一堆 Node3D 关节：每根骨头由 BoneAttachment3D 挂网格，
+## 旋转骨骼就是摆动肢体。这是 Godot 里骨骼绑定的正规做法，将来换成导入的模型
 ## 或者改用 AnimationPlayer 轨道时，层级结构不用动。
 ##
 ## 【易错】rest 与 pose 是两回事。`add_bone()` 会把两者都设成单位矩阵，而 `set_bone_rest()`
@@ -17,46 +28,51 @@ extends Node3D
 ##
 ## 两套样式由 style_index 选择，按玩家进入房间的顺序分配（见 scripts/net.gd）。
 ##
-## 身体是**连成一体**的：只把四肢做成各自独立的竖杆，手臂就会变成与躯干平行的两根
-## 悬空细杆、头也会浮在躯干上方（曾经就是这样）。所以除了竖杆，还需要：
+## 身体是**连成一体**的：只把四肢做成各自独立的杆，手臂就会变成与躯干平行的两根
+## 悬空细杆、头也会浮在躯干上方（曾今就是这样）。所以除了竖杆，还需要：
 ##   - 骨盆横杆：把两条腿连到躯干
 ##   - 肩横杆：把两条手臂连到躯干
-##   - 关节球：肢体一转动，两段圆柱的接缝处会裂开一个 V 形缝，用小球填住
+##   - 关节球：肢体一转动，两段的接缝处会裂开一个 V 形缝，用小球填住
 ##
 ## 持枪（`equip_gun`）：枪挂在右手骨头上，右臂摆出**持枪姿态**（`_aim_arm_rotation`）。
 ## 关键在于手臂要**反向补偿身体偏转**，否则枪口会跟着偏身歪掉、与准星不再一致。
 ##
 ## 坐标约定：脚本节点的原点是**脚底**，与 CharacterBody3D 的碰撞胶囊底部对齐。
 
-## 两套样式的差异都在这里。radius 是细杆半径：火柴人靠“细线 + 关节”辨识，
-## 圆柱太粗（曾用 4.3~5.2 cm）就会连成一根管子，不像火柴。
+# 不用 class_name：headless 与 --script 模式不写全局类缓存，写类名会报找不到类型。
+const Ink := preload("res://scripts/ink.gd")
+
+## 两套样式的差异都在这里。radius 是肢体半径（米）：
+## 太大（超过 5 厘米）两条腿会连成一块，太小（小于 2 厘米）就退回“骨架”而不是“火柴棍”。
 ##
 ## 眼睛的位置、大小都按 head_size 比例算，两套头形只需各自给出“前表面在哪”。
 ## eye_surface 是头中心到前表面的距离（球头取 0.88 是因为该高度上的球面会往内收）。
 const STYLES: Array = [
 	{
 		"name": "ember",
-		"limb": Color(0.90, 0.42, 0.20),
-		"head": Color(0.98, 0.74, 0.42),
-		"radius": 0.021,
+		"radius": 0.038,
 		"head_shape": "sphere",
 		"head_size": 0.115,
 		"eye_surface": 0.88,
+		# 实心墨色的头：黑白里最好认的差异就是一个是墨块、一个是白纸
+		"head_fill": Ink.INK,
+		"eye": Ink.PAPER,
+		# 这个角色的“墨水”：描边、弹道、命中特效、枪的配色都用它
+		"ink": Ink.INK,
 		"chest_band": false,
 	},
 	{
 		"name": "frost",
-		"limb": Color(0.22, 0.72, 0.92),
-		"head": Color(0.66, 0.94, 1.0),
-		"radius": 0.017,
+		"radius": 0.033,
 		"head_shape": "box",
 		"head_size": 0.105,
 		"eye_surface": 1.0,
+		"head_fill": Ink.PAPER,
+		"eye": Ink.INK,
+		"ink": Ink.GRAPHITE,
 		"chest_band": true,
 	},
 ]
-
-const EYE_COLOR := Color(0.06, 0.05, 0.08)   # 深色，在两种头色上都读得出是眼睛
 
 const HIPS_HEIGHT := 0.93    # 髖骨高度（骨盆横杆与大腿根就在这里）
 const SPINE_LEN := 0.58      # 骨盆到肩
@@ -251,12 +267,31 @@ func _attach_gun() -> void:
 	# 先入树再设位置：入树之后全局变换才成立
 	_attach("lower_arm_r").add_child(g)
 	g.position = Vector3(0.0, -LOWER_ARM_LEN, 0.0)   # 握在手的位置
-	g.build(_limb_mat.albedo_color)
+	# 配色取这个角色的**墨水色**（不是肤色）：枪的黑零件与主人的轮廓线同色，
+	# 而两人用不同灰度时，一眼能看出这把枪是谁的。
+	g.build(ink_color())
+	# 枪可能在“重建末尾那次关投影”之后才装上（equip_gun 是单独调的），
+	# 所以这里要再扫一次，否则枪的零件会在白墙上留下淡影。
+	_no_shadows(g)
 	gun = g
 
 
+## 这个角色的“墨水”色。弹道、命中特效、枪的配色都用它。
+##
+## 不能用肢体颜色：肢体现在是**纸白**，拿它去画弹道会得到一串看不见的白线
+## （改成黑白风格时最容易漏的一个地方）。
+func ink_color() -> Color:
+	return STYLES[style_index]["ink"]
+
+
+## 肢体表面色（纸白）。
 func limb_color() -> Color:
-	return _limb_mat.albedo_color if _limb_mat != null else Color.BLACK
+	return _limb_mat.albedo_color if _limb_mat != null else Ink.PAPER
+
+
+## 头部表面的填充色。黑白风格里两个人靠“头是不是实心墨块”最快分辨。
+func head_color() -> Color:
+	return _head_mat.albedo_color if _head_mat != null else Ink.PAPER
 
 
 func _rebuild() -> void:
@@ -272,15 +307,14 @@ func _rebuild() -> void:
 	_bones.clear()
 
 	var style: Dictionary = STYLES[style_index]
-	_limb_mat = StandardMaterial3D.new()
-	_limb_mat.albedo_color = style["limb"]
-	_limb_mat.roughness = 0.6
-	_head_mat = StandardMaterial3D.new()
-	_head_mat.albedo_color = style["head"]
-	_head_mat.roughness = 0.5
-	_eye_mat = StandardMaterial3D.new()
-	_eye_mat.albedo_color = EYE_COLOR
-	_eye_mat.roughness = 0.35
+	var outline: float = Ink.OUTLINE_LIMB
+	# 肢体：纸白 + 墨线描边。
+	_limb_mat = Ink.paper(Ink.PAPER, outline)
+	# 头：实心墨块（ember）不描边——墨块外面再套一条墨线只会糊成一团。
+	var head_fill: Color = style["head_fill"]
+	var head_dark := head_fill.v < 0.3
+	_head_mat = Ink.paper(head_fill, 0.0 if head_dark else outline)
+	_eye_mat = Ink.flat(style["eye"])
 
 	_skeleton = Skeleton3D.new()
 	_skeleton.name = "Skeleton3D"
@@ -321,6 +355,20 @@ func _rebuild() -> void:
 	if _gun_equipped:
 		_attach_gun()
 
+	# 线稿是平涂的：所有部件一律不投影。
+	# 放在重建的末尾统一扫一遍，而不是在每个 _add_* 里各写一次：
+	# 少写一处不会报错，只会让白墙上多一小块灰，很难发现。
+	# 枪挂在骨骼下面，所以这一扫也盖住了它。
+	_no_shadows(_skeleton)
+
+
+## 递归关掉这棵子树里所有网格的投影。
+func _no_shadows(node: Node) -> void:
+	if node is MeshInstance3D:
+		(node as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	for child in node.get_children():
+		_no_shadows(child)
+
 
 ## 取某根骨头的附件节点，没有就建一个。
 ##
@@ -338,11 +386,11 @@ func _attach(bone_name: String) -> BoneAttachment3D:
 	return attach
 
 
-## 横向的连接杆，把四肢接上躯干（圆柱默认沿 Y，转 90 度变成沿 X）。
+## 横向的连接杆，把四肢接上躯干（胶囊默认沿 Y，转 90 度变成沿 X）。
 func _add_bar(bone_name: String, offset: Vector3, length: float, radius: float) -> void:
 	var mesh_inst := MeshInstance3D.new()
 	mesh_inst.name = "bar"
-	mesh_inst.mesh = _make_cylinder(length, radius)
+	mesh_inst.mesh = _make_capsule(length, radius)
 	mesh_inst.rotation.z = PI * 0.5
 	mesh_inst.position = offset
 	mesh_inst.material_override = _limb_mat
@@ -364,14 +412,17 @@ func _add_joint(bone_name: String, offset: Vector3, radius: float) -> void:
 	_attach(bone_name).add_child(mesh_inst)
 
 
-func _make_cylinder(length: float, radius: float) -> CylinderMesh:
-	var cyl := CylinderMesh.new()
-	cyl.height = length
-	cyl.top_radius = radius
-	cyl.bottom_radius = radius
-	cyl.radial_segments = 6   # 细杆不需要圆滑，六边形够
-	cyl.rings = 1
-	return cyl
+## 造一段胶囊：两端是半球，所以看起来是根有体积的短棍，而不是一根线。
+##
+## `height` 是**包含两个半球**的总高，与本来的圆柱长度同义，所以调用处的偏移不用改。
+## 半球半径不能大于总高的一半，否则 Godot 会把高度夹到 2×radius。
+func _make_capsule(length: float, radius: float) -> CapsuleMesh:
+	var capsule := CapsuleMesh.new()
+	capsule.height = maxf(length, radius * 2.05)
+	capsule.radius = radius
+	capsule.radial_segments = 10
+	capsule.rings = 3   # 半球部分的分段：太少会看得出明显倒角
+	return capsule
 
 
 func _add_segment(
@@ -379,7 +430,7 @@ func _add_segment(
 ) -> void:
 	var mesh_inst := MeshInstance3D.new()
 	mesh_inst.name = "seg"
-	mesh_inst.mesh = _make_cylinder(length, radius)
+	mesh_inst.mesh = _make_capsule(length, radius)
 	mesh_inst.position = offset
 	mesh_inst.material_override = _limb_mat
 	_attach(bone_name).add_child(mesh_inst)

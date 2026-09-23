@@ -16,7 +16,10 @@ extends Node
 ##
 ## 分数上限可以用网址参数覆盖（`?kills=1`），自动化检查靠它把一局压缩到几秒。
 
+const Ink := preload("res://scripts/ink.gd")
+
 const DEFAULT_SCORE_LIMIT := 3
+
 ## 胜负横幅停留多久后开下一回合（秒）。太短来不及看清比分。
 const ROUND_HOLD := 4.5
 ## 回合开始时"ROUND n"横幅停留多久（秒）。
@@ -180,7 +183,8 @@ func _check_round_banner() -> void:
 		_hud_call("banner", [
 			"YOU WIN" if won else "YOU LOSE",
 			_score_line(),
-			Color(0.55, 1.0, 0.58) if won else Color(1.0, 0.42, 0.38),
+			# 胜用墨黑（最重）、败用石墨灰：黑白里靠浓淡拉开区别
+			Ink.INK if won else Ink.GRAPHITE,
 		])
 		return
 	if _intro_left > 0.0:
@@ -189,7 +193,7 @@ func _check_round_banner() -> void:
 	if Net.connected and not Net.has_opponent():
 		# 一个人先把房间开起来是常态（两台笔记本、先到的那台），
 		# 不提示的话对面看到的就是一个空场地，不知道还要不要把另一台打开。
-		_hud_call("banner", ["WAITING FOR OPPONENT", _room_hint(), Color(0.80, 0.86, 0.95)])
+		_hud_call("banner", ["WAITING FOR OPPONENT", _room_hint(), Ink.GRAPHITE])
 		return
 	_hud_call("banner", ["", ""])
 

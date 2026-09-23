@@ -10,7 +10,9 @@ extends Node
 
 const TRACER_TIME := 0.07     # 曳光存在时长。太短（曾用 0.045）在画面上一闪即逝，截不到也看不清
 const IMPACT_TIME := 0.22
-const TRACER_RADIUS := 0.013
+## 曳光粗细。黑白线稿里它就是“画出来的一条线”，所以比彩色时粗一些：
+## 细线在远处会溶进背景，而在白底上一条深色的弹道是最重要的射击反馈。
+const TRACER_RADIUS := 0.022
 ## 倒下时碎屑的飞行时长。比曳光长得多：这是“这个人没了”的那一下。
 const BURST_TIME := 0.55
 
@@ -19,6 +21,7 @@ var _bursts := 0
 
 
 ## 从 from 画一条到 to 的细线。
+## 颜色由调用方给（现在是主人的墨水色），所以这条线在黑白里读得出是谁打的。
 func tracer(from: Vector3, to: Vector3, color: Color) -> void:
 	var dir := to - from
 	var length := dir.length()
@@ -112,6 +115,9 @@ func burst(at: Vector3, color: Color, count := 12) -> void:
 
 
 func _spawn(node: Node3D) -> void:
+	# 线稿是平涂的：曳光与弹着点也不投影（在关掉阳光投影之前，它们会在白墙上留下淡影）
+	if node is MeshInstance3D:
+		(node as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	var scene := get_tree().current_scene
 	if scene == null:
 		# 场景还没就绪（例如 --script 自检）时，直接释放，不要抛异常

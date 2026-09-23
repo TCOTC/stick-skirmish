@@ -1,6 +1,10 @@
 class_name HealthBar3D
 extends Node3D
-## 替身头顶的血条：底色 + 填充两个方片。
+## 替身头顶的血条：墨色外框 + 纸白填充。
+##
+## 【黑白里怎么表达血量】长度就是唯一的读数：底色画成**实心墨条**，填充画成纸白，
+## 于是“还剩多少白”就是还剩多少血。不再按血量调色（绿→红）：色相在黑白风格里不存在，
+## 而且同屏两个人都得能一眼读出各自的剩血。
 ##
 ## 【为什么不用 billboard 材质】两个方片几乎完全重合，只靠零点几毫米的偏移分先后。
 ## billboard 只改顶点的朝向、**不改位置**，于是那点偏移朝哪个方向取决于血条节点的旋转，
@@ -14,8 +18,12 @@ extends Node3D
 ## 填充条要**从左端开始缩**，所以填充方片挂在一个 pivot 下，
 ## 方片自身右移半个宽度，于是缩放 pivot 的 x 就是从左边收。
 
+const Ink := preload("res://scripts/ink.gd")
+
 const WIDTH := 0.85
 const HEIGHT := 0.12
+## 墨色外框每边多出来的宽度。填充是纸白、底色是墨，所以这一圈就是“描边”。
+const BORDER := 0.028
 const HEIGHT_ABOVE := 2.05   # 火柴人约 1.75 米高，放在头顶上方
 ## 填充相对底色的前移量。它现在**朝相机**（局部 +Z 由 look_at 保证），
 ## 所以不会随替身朝向变成“跑到后面去”，可以放心用几何前后关系定顺序。
@@ -36,6 +44,7 @@ func _process(_delta: float) -> void:
 	_face_camera()
 
 
+## 更新血量。`frac` 会做 0..1 限制，所以传入超范围的数也不会画歪。
 func set_health(hp: int, max_hp: int) -> void:
 	# 幂等建一次：调用方往往是“add_child 之后立刻 set_health”，
 	# 而那种时机下 `_ready` 还没跑（入树与就绪不是同一时刻），不先建就会访问到 null。
@@ -46,11 +55,6 @@ func set_health(hp: int, max_hp: int) -> void:
 		_pivot.scale = Vector3(frac, 1.0, 1.0)
 	if _fill != null:
 		_fill.visible = frac > 0.001
-	# 血量越低越红，一眼能看出谁快倒了。数值取得比“正确颜色”更艳一点：
-	# 场景是夜色调，还有 tonemap，按理论值取会显得发脏。
-	var mat := _fill.material_override as StandardMaterial3D
-	if mat != null:
-		mat.albedo_color = Color(0.35 + 0.65 * (1.0 - frac), 0.30 + 0.70 * frac, 0.28)
 
 
 func _ensure_built() -> void:
@@ -61,9 +65,10 @@ func _ensure_built() -> void:
 
 
 func _build() -> void:
-	# 底色不能太黑：血量归零时填充会隐藏，只剩底色，太暗就看不见这个人已经倒了。
-	add_child(_quad(Vector3(0.0, 0.0, 0.0), Vector2(WIDTH, HEIGHT),
-		Color(0.10, 0.11, 0.14, 0.9)))
+	# 墨色底：比填充大一圈，于是周围留出的那圈就是描边。
+	# 也不能太薄：空血时填充会隐藏，只剩这块墨，太薄就看不出这个人已经倒了。
+	add_child(_quad(Vector3(0.0, 0.0, 0.0),
+		Vector2(WIDTH + BORDER * 2.0, HEIGHT + BORDER * 2.0), Ink.INK))
 
 	_pivot = Node3D.new()
 	_pivot.name = "FillPivot"
@@ -71,8 +76,7 @@ func _build() -> void:
 	_pivot.position = Vector3(-WIDTH * 0.5, 0.0, FILL_FORWARD)
 	add_child(_pivot)
 
-	_fill = _quad(Vector3(WIDTH * 0.5, 0.0, 0.0), Vector2(WIDTH, HEIGHT),
-		Color(0.30, 0.85, 0.28))
+	_fill = _quad(Vector3(WIDTH * 0.5, 0.0, 0.0), Vector2(WIDTH, HEIGHT), Ink.PAPER)
 	_pivot.add_child(_fill)
 
 
@@ -103,10 +107,7 @@ func _quad(offset: Vector3, size: Vector2, color: Color) -> MeshInstance3D:
 	mesh_inst.position = offset
 	mesh_inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	# 不再 no_depth_test：否则血条会隔着墙显示，而且填充与底色的先后就没人管了。
-	# 现在两者差 FILL_FORWARD，由深度测试定死顺序。
-	mesh_inst.material_override = mat
+	# 用 ink.gd 的平涂材质：血条是一块牌子，不该受场景光照影响
+	# （夜晚的暗光曾经把它压成一块看不出颜色的灰片）。
+	mesh_inst.material_override = Ink.flat(color)
 	return mesh_inst

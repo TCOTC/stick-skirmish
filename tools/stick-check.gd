@@ -39,6 +39,7 @@ var _avatar_details: Array[String] = []
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存，
 # 直接写 StickFigure 会报 "Could not find type"。
 const StickFigureScript := preload("res://scripts/stick_figure.gd")
+const Ink := preload("res://scripts/ink.gd")
 
 # 膝盖弯曲幅度不应超过这个值（KNEE_BEND * 最大摆幅 + 余量）
 const KNEE_LIMIT := 1.0
@@ -242,6 +243,75 @@ func _check_extras(fig: Node, tag := "") -> void:
 	)
 
 
+## 肢体必须“有体积”，而不是一根线：
+##   - 用胶囊/球（圆柱只能给出“线”，胶囊两端是半球，看起来才是根棍）
+##   - 半径不能退回到毫米级（1.7 厘米以下就看不出体积了）
+##   - 每个部件外面必须套墨线描边（反壳），不然角色在白底上就是一团白
+##
+## 这三条是这套美术风格的核心，截图看“像不像”很主观，但“用的什么网格/有没有描边”是确定的。
+func _check_volume(fig: Node, tag := "") -> void:
+	var thin: Array[String] = []
+	var not_round: Array[String] = []
+	var unlined: Array[String] = []
+	var min_radius := 999.0
+	var worst_pass: StandardMaterial3D = null
+	for child in fig.get_node("Skeleton3D").get_children():
+		if not (child is BoneAttachment3D):
+			continue
+		for sub in child.get_children():
+			if not (sub is MeshInstance3D):
+				continue
+			var mesh: Mesh = sub.mesh
+			# 眼睛是平涂的小球，不参与“体积”这一项
+			var kind := _kind_of(String(sub.name))
+			if kind == "eye":
+				continue
+			if mesh is CylinderMesh:
+				not_round.append(String(sub.name))
+				continue
+			var r := _part_radius(mesh)
+			if r > 0.0:
+				min_radius = minf(min_radius, r)
+				if r < 0.02:
+					thin.append("%s %.3f" % [sub.name, r])
+			var mat := sub.material_override as StandardMaterial3D
+			# 纸白的部件必须有描边，否则它就是一坨白；
+			# 实心墨块（ember 的头）不需要：墨块外再套一条墨线只会糊成一团。
+			if mat == null:
+				unlined.append(String(sub.name))
+			elif mat.next_pass == null and mat.albedo_color.v >= 0.3:
+				unlined.append(String(sub.name))
+			elif mat.next_pass is StandardMaterial3D:
+				worst_pass = mat.next_pass as StandardMaterial3D
+
+	_check(not_round.is_empty(), tag + "肢体用胶囊/球，不是细圆柱",
+		" / ".join(not_round) if not not_round.is_empty() else "全部为圆头网格")
+	_check(thin.is_empty(), tag + "肢体半径够粗（有体积）",
+		"最细 %.1f 毫米（下限 20）" % (min_radius * 1000.0)
+		+ ("；过细的：" + " / ".join(thin) if not thin.is_empty() else ""))
+	_check(unlined.is_empty(), tag + "纸白部件都有墨线描边",
+		"缺描边：" + " / ".join(unlined) if not unlined.is_empty() else "全部带 next_pass 描边（实心墨块除外）")
+	# 描边的做法必须是“放大 + 反向剔面”，两者任一缺失都看不出轮廓：
+	# 只放大不剔面 → 整个盖住物体；只剔面不放大 → 什么也看不见。
+	_check(
+		worst_pass != null and worst_pass.grow and worst_pass.grow_amount > 0.0
+			and worst_pass.cull_mode == BaseMaterial3D.CULL_FRONT,
+		"描边材质是反壳（放大 + 反向剔面）",
+		"grow=%.3f cull_front=%s" % [
+			worst_pass.grow_amount if worst_pass != null else 0.0,
+			worst_pass.cull_mode == BaseMaterial3D.CULL_FRONT if worst_pass != null else false]
+	)
+
+
+## 取一个部件网格的半径；量不出来（返回 -1）表示这个形状不参与半径比较。
+func _part_radius(mesh: Mesh) -> float:
+	if mesh is CapsuleMesh:
+		return (mesh as CapsuleMesh).radius
+	if mesh is SphereMesh:
+		return (mesh as SphereMesh).radius
+	return -1.0
+
+
 ## 检查骨头默认姿态下的世界高度。
 ##
 ## 这一项是补上的：只设 rest 不设 pose 时，所有骨头都会堆在骨骼原点，
@@ -420,19 +490,36 @@ func _run_checks() -> void:
 		_check_connected(fig, tag)
 		_check_extras(fig, tag)
 		_check_eyes(fig, tag)
+		_check_volume(fig, tag)
 
 	fig.apply_style(0)
 	_check_bone_heights(fig)
 
 	# --- 样式 ---
-	var color_a: Color = fig.limb_color()
+	# 黑白风格里两套样式**不能靠色相区分**（已经全去色了），可比的就是：
+	# 墨水色的深浅（弹道用）、头是不是实心墨块、以及轻微不同的肢体粗细。
+	var ink_a: Color = fig.ink_color()
+	var head_a: Color = fig.head_color()
 	var name_a: String = fig.style_name()
 	fig.apply_style(1)
-	var color_b: Color = fig.limb_color()
+	var ink_b: Color = fig.ink_color()
+	var head_b: Color = fig.head_color()
 	var name_b: String = fig.style_name()
-	_check(color_a != color_b, "两套样式颜色不同", "%s %s / %s %s" % [
-		name_a, color_a.to_html(false), name_b, color_b.to_html(false)])
+	_check(ink_a != ink_b, "两套样式的墨水色不同（弹道能分辨是谁打的）", "%s %s / %s %s" % [
+		name_a, ink_a.to_html(false), name_b, ink_b.to_html(false)])
 	_check(name_a != name_b, "两套样式名称不同", "%s / %s" % [name_a, name_b])
+	_check(
+		head_a.v != head_b.v and absf(head_a.v - head_b.v) > 0.3,
+		"两套样式的头一深一浅（黑白里最好认的差别）",
+		"%s v=%.2f / %s v=%.2f" % [name_a, head_a.v, name_b, head_b.v]
+	)
+	_check(
+		Ink.is_gray(ink_a) and Ink.is_gray(ink_b) and Ink.is_gray(head_a) and Ink.is_gray(head_b),
+		"样式配色全部是灰（没有色相）",
+		"%s/%s/%s/%s 饱和度 %.2f/%.2f/%.2f/%.2f" % [
+			name_a, name_b, name_a, name_b,
+			ink_a.s, ink_b.s, head_a.s, head_b.s]
+	)
 	_check(
 		counts_by_style[1] == counts_by_style[0] + 1,
 		"样式 B 比 A 多一件（胸前横带）",

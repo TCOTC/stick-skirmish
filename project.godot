@@ -46,4 +46,5 @@ window/stretch/mode="canvas_items"
 
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
-anti_aliasing/quality/msaa_3d=1
+; 线稿风格全靠细线：不开 MSAA 的话远处的棱线会碎成虚线（实测 2x 仍有，取 4x）。
+anti_aliasing/quality/msaa_3d=2

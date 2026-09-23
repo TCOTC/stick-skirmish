@@ -38,6 +38,7 @@ const GROUND_Y_MAX := 0.3
 
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
 const StickFigureScript := preload("res://scripts/stick_figure.gd")
+const Ink := preload("res://scripts/ink.gd")
 const HealthBarScript := preload("res://scripts/health_bar_3d.gd")
 
 var my_id := 0
@@ -741,7 +742,7 @@ func _peer_kill(victim_id: int, killer_id: int) -> void:
 	# 倒下的一瞬间溅一团碎屑：位置取替身当前位置，效果只在本机播，不需要同步。
 	var avatar = _avatars.get(victim_id)
 	if avatar != null:
-		Fx.burst(avatar.global_position + Vector3(0.0, 1.1, 0.0), avatar.limb_color())
+		Fx.burst(avatar.global_position + Vector3(0.0, 1.1, 0.0), avatar.ink_color())
 	Match.apply_remote_kill(victim_id, killer_id)
 
 
@@ -781,11 +782,14 @@ func _trace(origin: Vector3, direction: Vector3) -> Dictionary:
 
 
 ## 射手样式的颜色，用来给曳光与弹着点上色，方便分辨是谁打的。
+## 替身对应的“墨水色”。弹道与命中特效用它，所以左右两人打出来的线深浅不同。
+##
+## 取的是 ink_color 而不是肢体颜色：肢体现在是纸白，拿它画弹道会得到一串看不见的白线。
 func _peer_color(id: int) -> Color:
 	var avatar = _avatars.get(id)
-	if avatar != null and avatar.has_method("limb_color"):
-		return avatar.limb_color()
-	return Color(1.0, 0.9, 0.5)
+	if avatar != null and avatar.has_method("ink_color"):
+		return avatar.ink_color()
+	return Ink.INK
 
 
 func _hud_node() -> Node:

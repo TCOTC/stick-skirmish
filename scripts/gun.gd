@@ -1,8 +1,11 @@
 class_name Gun
 extends Node3D
-## 火柴人风格的枪：细杆 + 小方块拼成，与角色一样靠“细线 + 关节”辨识。
+## 火柴人风格的枪：细杆 + 小方块拼成，与角色一样靠“结构件 + 墨线”辨识。
 ##
-## 【朝向约定】枪沿**本地 -Y** 构造（与肢体竖杆一致）。于是把它挂到右手骨头上，
+## 【颜色】零件只有两种：**纸白**（枪管、机匣、准星）与**主人的墨水色**（弹匣、握把、
+## 枪托）。不再有“金属灰 + 彩色点缀”——黑白线稿里由墨线的位置而非色相区分零件。
+##
+## 【朝向约定】枪沿**本地 -Y** 构造（与肢体一致）。于是把它挂到右手骨头上，
 ## 手臂往前伸时枪口自然朝前，不需要另算旋转。见 stick_figure.gd 的 `_aim_arm_rotation()`。
 ##
 ## 本地坐标系在“手臂前伸”后映射到角色空间：
@@ -11,7 +14,8 @@ extends Node3D
 ##
 ## 膛口火光用 `flash()` 触发，靠一个计时器自动收起，不需要外部管理。
 
-const METAL := Color(0.16, 0.17, 0.20)
+const Ink := preload("res://scripts/ink.gd")
+
 const BARREL_LEN := 0.34
 const BARREL_TIP := 0.44      # 枪口到握把原点的距离
 const FLASH_TIME := 0.07      # 膛口火光时长，与曳光差不多，一起形成“一发的印象”
@@ -31,11 +35,11 @@ var _kick := 0.0
 
 
 func _ready() -> void:
-	set_process(false)   # 只有火光还亮着时才需要每帧跑
+	set_process(false)   # 只有火光还亮着或还在回位时才需要每帧跑
 
 
-## accent 用角色样式的颜色，让枪和主人一眼能对上。
-func build(accent: Color) -> void:
+## 造出这把枪。`ink` 是主人的墨水色（见 stick_figure.ink_color）。
+func build(ink: Color) -> void:
 	for child in get_children():
 		remove_child(child)
 		child.queue_free()
@@ -43,21 +47,22 @@ func build(accent: Color) -> void:
 	_kick = 0.0
 	_rest = position
 
-	var metal := _mat(METAL)
-	var tint := _mat(accent)
+	var paper := Ink.paper(Ink.PAPER, Ink.OUTLINE_PART)
+	var dark := Ink.paper(ink, Ink.OUTLINE_PART)
 
-	# 枪管：细杆，从握把往前伸
-	_add_cylinder(Vector3(0.0, -BARREL_LEN * 0.5 - 0.05, 0.0), 0.015, BARREL_LEN, metal)
-	# 机匣：握把附近的主体
-	_add_box(Vector3(0.0, -0.02, 0.0), Vector3(0.05, 0.18, 0.05), metal)
+	# 枪管与机匣用**墨水色**、握把那一系用纸白：
+	# 反过来（白枪管 + 黑握把）在远处就是一手白色里的一小团白，看不出手里有东西。
+	# 深色主体在白手与白背景之间一下子就能读出来，这是第三人称下判断枪口朝向的前提。
+	_add_cylinder(Vector3(0.0, -BARREL_LEN * 0.5 - 0.05, 0.0), 0.015, BARREL_LEN, dark)
+	_add_box(Vector3(0.0, -0.02, 0.0), Vector3(0.05, 0.18, 0.05), dark)
 	# 弹匣：朝下挂（+Z 就是枪的下方）
-	_add_box(Vector3(0.0, -0.05, 0.055), Vector3(0.035, 0.10, 0.06), tint)
+	_add_box(Vector3(0.0, -0.05, 0.055), Vector3(0.035, 0.10, 0.06), paper)
 	# 握把：握把原点后方一点
-	_add_box(Vector3(0.0, 0.05, 0.055), Vector3(0.035, 0.10, 0.05), tint)
+	_add_box(Vector3(0.0, 0.05, 0.055), Vector3(0.035, 0.10, 0.05), paper)
 	# 枪托：向后延伸
-	_add_box(Vector3(0.0, 0.13, 0.015), Vector3(0.04, 0.13, 0.045), tint)
+	_add_box(Vector3(0.0, 0.13, 0.015), Vector3(0.04, 0.13, 0.045), paper)
 	# 准星：枪口前上方的小块（+Z 是下方，所以这里取负）
-	_add_box(Vector3(0.0, -BARREL_TIP + 0.06, -0.025), Vector3(0.02, 0.03, 0.02), metal)
+	_add_box(Vector3(0.0, -BARREL_TIP + 0.06, -0.025), Vector3(0.02, 0.03, 0.02), dark)
 
 	# 枪口节点：曳光/命中判定从这里出发
 	_muzzle = Node3D.new()
@@ -78,13 +83,9 @@ func build(accent: Color) -> void:
 	# 锥体默认沿 Y、尖端在 +Y；绕 X 转 180 度让尖端指向 -Y（枪口方向）
 	_flash.rotation.x = PI
 	_flash.position = Vector3(0.0, -BARREL_TIP - 0.06, 0.0)
-	var flash_mat := StandardMaterial3D.new()
-	flash_mat.albedo_color = Color(1.0, 0.92, 0.62)
-	flash_mat.emission_enabled = true
-	flash_mat.emission = Color(1.0, 0.85, 0.45)
-	flash_mat.emission_energy_multiplier = 2.0
-	flash_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	_flash.material_override = flash_mat
+	# 黑白里的枪火用**墨**：纸白的火光在白底上什么也看不见，
+	# 而一块射出的墨迹反而最像手绘的“砰”。
+	_flash.material_override = Ink.flat(Ink.INK)
 	_flash.visible = false
 	add_child(_flash)
 
@@ -123,13 +124,6 @@ func muzzle_forward() -> Vector3:
 	if _muzzle == null:
 		return -global_transform.basis.y
 	return -_muzzle.global_transform.basis.y
-
-
-func _mat(color: Color) -> StandardMaterial3D:
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mat.roughness = 0.55
-	return mat
 
 
 func _add_cylinder(offset: Vector3, radius: float, length: float, mat: Material) -> void:
