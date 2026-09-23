@@ -17,20 +17,35 @@ extends CharacterBody3D
 
 const MOVE_ACTIONS := ["move_forward", "move_back", "move_left", "move_right", "jump"]
 
+# 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
+const StickFigureScript := preload("res://scripts/stick_figure.gd")
+
 var _pitch: float = -0.22
 var _gravity: float = 24.0
 # 是否处于"正在操作"状态。判定标准就是鼠标是否被锁定：
 # 光标还露在外面（还没点进游戏，或者刚按了 Esc）就不该能操作。
 var _input_active := false
 
+## 火柴人外观。样式（两套之一）由 net.gd 按进入房间的顺序决定。
+var figure: StickFigureScript = null
+
 
 func _ready() -> void:
 	_ensure_actions()
 	_gravity = float(ProjectSettings.get_setting("physics/3d/default_gravity", 9.8))
 	_arm.rotation.x = _pitch
+	_build_figure()
 	# 注意：不要在这里抢鼠标锁定。浏览器要求 pointer lock 必须由用户手势触发，
 	# 否则会抛 WrongDocumentError；玩家第一次点击时再接管（见 _unhandled_input）。
 	print("[player] ready pos=", global_position)
+
+
+## 外观用骨骼绑定的火柴人（见 stick_figure.gd），不再用胶囊网格。
+## 脚本节点的原点是脚底，与碰撞胶囊底部对齐，所以直接放在本地原点即可。
+func _build_figure() -> void:
+	figure = StickFigureScript.new()
+	figure.name = "Figure"
+	add_child(figure)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -80,6 +95,10 @@ func _physics_process(delta: float) -> void:
 	velocity.x = dir.x * move_speed
 	velocity.z = dir.z * move_speed
 	move_and_slide()
+
+	# 步态用水平速度驱动：走快摆幅大、停下回直立、离地换空中姿势。
+	if figure != null:
+		figure.animate(Vector2(velocity.x, velocity.z).length(), is_on_floor(), delta)
 
 
 func _notification(what: int) -> void:

@@ -1,0 +1,401 @@
+class_name StickFigure
+extends Node3D
+## 火柴人角色：Skeleton3D 骨骼 + BoneAttachment3D 挂网格 + 程序化步态动画。
+##
+## 为什么用真正的 Skeleton3D 而不是一堆 Node3D 关节：每根骨头由 BoneAttachment3D 挂一个
+## 圆柱网格，旋转骨骼就是摆动肢体。这是 Godot 里骨骼绑定的正规做法，将来换成导入的模型
+## 或者改用 AnimationPlayer 轨道时，层级结构不用动。
+##
+## 【易错】rest 与 pose 是两回事。`add_bone()` 会把两者都设成单位矩阵，而 `set_bone_rest()`
+## 只改 rest。骨骼附件（BoneAttachment3D）跟随的是 **pose**（`get_bone_global_pose()`），
+## 所以只设 rest 的话所有骨头都堆在骨骼原点，整个角色缩成一团（曾踩过：头在 1.04 米、
+## 脚在 0.70 米，看起来只有头和一根躯干，手臂和腿全部重叠）。建骨时必须把 pose 一并设上。
+##
+## 动画为什么不用 AnimationPlayer：步态需要随移动速度连续变化（走得快摆幅就大），
+## 用轨道资源是先量化再插值，反而更绕；而且轨道路径写错了不会报错，只是不生效，很难发现。
+## 这里按相位直接算骨骼角度，参数集中在下方的常量里，方便调手感。
+##
+## 两套样式由 style_index 选择，按玩家进入房间的顺序分配（见 scripts/net.gd）。
+##
+## 身体是**连成一体**的：只把四肢做成各自独立的竖杆，手臂就会变成与躯干平行的两根
+## 悬空细杆、头也会浮在躯干上方（曾经就是这样）。所以除了竖杆，还需要：
+##   - 骨盆横杆：把两条腿连到躯干
+##   - 肩横杆：把两条手臂连到躯干
+##   - 关节球：肢体一转动，两段圆柱的接缝处会裂开一个 V 形缝，用小球填住
+##
+## 坐标约定：脚本节点的原点是**脚底**，与 CharacterBody3D 的碰撞胶囊底部对齐。
+
+## 细杆半径。火柴人靠“细线 + 关节”辨识，圆柱太粗就会连成一根管子，不像火柴。
+const STYLES: Array = [
+	{
+		"name": "ember",
+		"limb": Color(0.90, 0.42, 0.20),
+		"head": Color(0.98, 0.74, 0.42),
+		"radius": 0.021,
+		"head_shape": "sphere",
+		"head_size": 0.115,
+		"chest_band": false,
+	},
+	{
+		"name": "frost",
+		"limb": Color(0.22, 0.72, 0.92),
+		"head": Color(0.66, 0.94, 1.0),
+		"radius": 0.017,
+		"head_shape": "box",
+		"head_size": 0.105,
+		"chest_band": true,
+	},
+]
+
+const HIPS_HEIGHT := 0.93    # 髖骨高度（骨盆横杆与大腿根就在这里）
+const SPINE_LEN := 0.58      # 骨盆到肩
+const NECK_LEN := 0.09       # 肩到头底
+const UPPER_ARM_LEN := 0.30
+const LOWER_ARM_LEN := 0.28  # 手垂到髖部高度
+const UPPER_LEG_LEN := 0.46
+const LOWER_LEG_LEN := 0.44  # 脚离地 0.03
+const SHOULDER_X := 0.19
+const HIP_X := 0.09
+
+# [名称, 父名称, 相对父的 rest 位置]。父必须排在子之前。
+#
+# spine 的原点与 hips 重合（都放在骨盆），不是为了省节点，而是让躯干前倾围绕**骨盆**旋转：
+# 原点若设在躯干中段，前倾时下半截会向后甩，与骨盆、大腿之间裂开约 3.5 厘米的缝。
+const BONES: Array = [
+	["hips", "", Vector3(0.0, HIPS_HEIGHT, 0.0)],
+	["spine", "hips", Vector3(0.0, 0.0, 0.0)],
+	["neck", "spine", Vector3(0.0, SPINE_LEN, 0.0)],
+	["head", "neck", Vector3(0.0, NECK_LEN, 0.0)],
+	["upper_arm_l", "neck", Vector3(SHOULDER_X, 0.0, 0.0)],
+	["lower_arm_l", "upper_arm_l", Vector3(0.0, -UPPER_ARM_LEN, 0.0)],
+	["upper_arm_r", "neck", Vector3(-SHOULDER_X, 0.0, 0.0)],
+	["lower_arm_r", "upper_arm_r", Vector3(0.0, -UPPER_ARM_LEN, 0.0)],
+	["upper_leg_l", "hips", Vector3(HIP_X, 0.0, 0.0)],
+	["lower_leg_l", "upper_leg_l", Vector3(0.0, -UPPER_LEG_LEN, 0.0)],
+	["upper_leg_r", "hips", Vector3(-HIP_X, 0.0, 0.0)],
+	["lower_leg_r", "upper_leg_r", Vector3(0.0, -UPPER_LEG_LEN, 0.0)],
+]
+
+# 竖杆：[骨骼, 网格中心相对骨骼的位置, 长度, 半径系数]
+# 方向约定：**躯干从骨盆向上长（+Y），四肢从骨骼原点向下垂（-Y）**。
+# 符号写反不会报错，只是那一段会挂到身体外面去——自检里的相接检查就是为了抓这个。
+const SEGMENTS: Array = [
+	["spine", Vector3(0.0, SPINE_LEN * 0.5, 0.0), SPINE_LEN, 1.15],
+	["neck", Vector3(0.0, 0.055, 0.0), 0.11, 0.90],
+	["upper_arm_l", Vector3(0.0, -UPPER_ARM_LEN * 0.5, 0.0), UPPER_ARM_LEN, 0.85],
+	["lower_arm_l", Vector3(0.0, -LOWER_ARM_LEN * 0.5, 0.0), LOWER_ARM_LEN, 0.75],
+	["upper_arm_r", Vector3(0.0, -UPPER_ARM_LEN * 0.5, 0.0), UPPER_ARM_LEN, 0.85],
+	["lower_arm_r", Vector3(0.0, -LOWER_ARM_LEN * 0.5, 0.0), LOWER_ARM_LEN, 0.75],
+	["upper_leg_l", Vector3(0.0, -UPPER_LEG_LEN * 0.5, 0.0), UPPER_LEG_LEN, 0.95],
+	["lower_leg_l", Vector3(0.0, -LOWER_LEG_LEN * 0.5, 0.0), LOWER_LEG_LEN, 0.85],
+	["upper_leg_r", Vector3(0.0, -UPPER_LEG_LEN * 0.5, 0.0), UPPER_LEG_LEN, 0.95],
+	["lower_leg_r", Vector3(0.0, -LOWER_LEG_LEN * 0.5, 0.0), LOWER_LEG_LEN, 0.85],
+]
+
+# 横杆：[骨骼, 相对位置, 长度, 半径系数]。它们是把四肢接上躯干的关键。
+const CROSS_BARS: Array = [
+	["hips", Vector3.ZERO, HIP_X * 2.0 + 0.04, 1.00],           # 骨盆：连两条腿
+	["neck", Vector3.ZERO, SHOULDER_X * 2.0 + 0.06, 0.95],     # 肩：连两条手臂
+]
+
+# 关节球：[骨骼, 相对位置, 半径系数]。填住两段圆柱转动时裂开的 V 形缝。
+const JOINTS: Array = [
+	["upper_arm_l", Vector3.ZERO, 1.35],
+	["lower_arm_l", Vector3.ZERO, 1.20],
+	["upper_arm_r", Vector3.ZERO, 1.35],
+	["lower_arm_r", Vector3.ZERO, 1.20],
+	["upper_leg_l", Vector3.ZERO, 1.30],
+	["lower_leg_l", Vector3.ZERO, 1.20],
+	["upper_leg_r", Vector3.ZERO, 1.30],
+	["lower_leg_r", Vector3.ZERO, 1.20],
+]
+
+# --- 步态参数（弧度） -------------------------------------------------------
+const STEP_FREQ_BASE := 5.5      # 刚起步时的步频（弧度/秒）
+const STEP_FREQ_PER_SPEED := 0.85 # 每快 1 m/s 追加的步频
+const STEP_SPEED_FULL := 5.0     # 达到多少 m/s 时摆幅到最大
+const STEP_AMP_MIN := 0.30
+const LEG_SWING := 0.62
+const KNEE_BEND := 0.80
+const ARM_SWING := 0.50
+const ELBOW_BEND := 0.32
+const TORSO_LEAN := 0.12
+const BOB := 0.035
+const AMP_RATE := 3.5            # 摆幅增减速度
+const AIR_BLEND_RATE := 7.0      # 地面/空中姿态的过渡速度
+const WALK_THRESHOLD := 0.4      # 低于这个速度算站着
+
+# --- 空中姿态 ---------------------------------------------------------------
+const AIR_LEG_L := 0.55
+const AIR_LEG_R := -0.30
+const AIR_KNEE_L := -1.00
+const AIR_KNEE_R := -0.50
+const AIR_ARM := -1.90
+const AIR_ELBOW := 0.45
+const AIR_LEAN := 0.18
+
+var style_index := 0
+
+var _skeleton: Skeleton3D = null
+var _bones: Dictionary = {}
+var _limb_mat: StandardMaterial3D = null
+var _head_mat: StandardMaterial3D = null
+var _phase := 0.0
+var _amp := 0.0
+var _air := 0.0
+var _built := false
+
+
+func _ready() -> void:
+	build()
+
+
+func build() -> void:
+	if _built:
+		return
+	_built = true
+	_rebuild()
+
+
+## 按进入房间的顺序选样式。序号是取模的，所以传进来多少都不会越界。
+func apply_style(index: int) -> void:
+	var count := STYLES.size()
+	style_index = ((index % count) + count) % count
+	if _built:
+		_rebuild()
+
+
+func style_name() -> String:
+	return str(STYLES[style_index]["name"])
+
+
+## 读取某根骨头当前的俯仰角（弧度），供自动化检查判断"关节到底动没动"。
+func bone_angle(bone_name: String) -> float:
+	var idx: int = _bones.get(bone_name, -1)
+	if idx < 0 or _skeleton == null:
+		return 0.0
+	return _skeleton.get_bone_pose_rotation(idx).get_euler().x
+
+
+func limb_color() -> Color:
+	return _limb_mat.albedo_color if _limb_mat != null else Color.BLACK
+
+
+func _rebuild() -> void:
+	# 先摘掉旧节点再重建：remove_child 立即生效，queue_free 只是延迟释放。
+	for child in get_children():
+		remove_child(child)
+		child.queue_free()
+	_bones.clear()
+
+	var style: Dictionary = STYLES[style_index]
+	_limb_mat = StandardMaterial3D.new()
+	_limb_mat.albedo_color = style["limb"]
+	_limb_mat.roughness = 0.6
+	_head_mat = StandardMaterial3D.new()
+	_head_mat.albedo_color = style["head"]
+	_head_mat.roughness = 0.5
+
+	_skeleton = Skeleton3D.new()
+	_skeleton.name = "Skeleton3D"
+	add_child(_skeleton)
+
+	for bone in BONES:
+		var bone_name: String = bone[0]
+		_skeleton.add_bone(bone_name)
+		var idx := _skeleton.get_bone_count() - 1
+		var parent_name: String = bone[1]
+		var parent_idx := -1
+		if parent_name != "":
+			parent_idx = int(_bones[parent_name])
+		_skeleton.set_bone_parent(idx, parent_idx)
+		# rest 与 pose 都要设：rest 是绑定姿势，pose 才是实际参与计算的那个。
+		var offset: Vector3 = bone[2]
+		_skeleton.set_bone_rest(idx, Transform3D(Basis(), offset))
+		_skeleton.set_bone_pose_position(idx, offset)
+		_skeleton.set_bone_pose_rotation(idx, Quaternion())
+		_bones[bone_name] = idx
+
+	var radius: float = style["radius"]
+	for seg in SEGMENTS:
+		_add_segment(seg[0], seg[1], seg[2], radius * float(seg[3]))
+
+	for bar in CROSS_BARS:
+		_add_bar(bar[0], bar[1], bar[2], radius * float(bar[3]))
+
+	for joint in JOINTS:
+		_add_joint(joint[0], joint[1], radius * float(joint[2]))
+
+	_add_head(style, radius)
+
+	if bool(style["chest_band"]):
+		_add_chest_band(radius)
+
+
+## 取某根骨头的附件节点，没有就建一个。
+##
+## 必须复用：每根骨头只留一个附件，同一骨头上的杆、横杆、关节球都挂在它下面。
+## 如果每个网格各建一个新附件，同一骨骼的附件会彼此覆盖（自检按骨骼统计网格时就会漏），
+## 而且节点数会平白翻倍。
+func _attach(bone_name: String) -> BoneAttachment3D:
+	for child in _skeleton.get_children():
+		if child is BoneAttachment3D and child.bone_name == bone_name:
+			return child
+	var attach := BoneAttachment3D.new()
+	# 先入树再设 bone_name：反过来的话 bone_idx 要等跑过一帧才解析出来。
+	_skeleton.add_child(attach)
+	attach.bone_name = bone_name
+	return attach
+
+
+## 横向的连接杆，把四肢接上躯干（圆柱默认沿 Y，转 90 度变成沿 X）。
+func _add_bar(bone_name: String, offset: Vector3, length: float, radius: float) -> void:
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.name = "bar"
+	mesh_inst.mesh = _make_cylinder(length, radius)
+	mesh_inst.rotation.z = PI * 0.5
+	mesh_inst.position = offset
+	mesh_inst.material_override = _limb_mat
+	_attach(bone_name).add_child(mesh_inst)
+
+
+## 关节处的球，半径比相邻细杆略粗，用来填住肢体转动时裂开的缝。
+func _add_joint(bone_name: String, offset: Vector3, radius: float) -> void:
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.name = "joint"
+	var sphere := SphereMesh.new()
+	sphere.radius = radius
+	sphere.height = radius * 2.0
+	sphere.radial_segments = 8
+	sphere.rings = 4
+	mesh_inst.mesh = sphere
+	mesh_inst.position = offset
+	mesh_inst.material_override = _limb_mat
+	_attach(bone_name).add_child(mesh_inst)
+
+
+func _make_cylinder(length: float, radius: float) -> CylinderMesh:
+	var cyl := CylinderMesh.new()
+	cyl.height = length
+	cyl.top_radius = radius
+	cyl.bottom_radius = radius
+	cyl.radial_segments = 6   # 细杆不需要圆滑，六边形够
+	cyl.rings = 1
+	return cyl
+
+
+func _add_segment(
+	bone_name: String, offset: Vector3, length: float, radius: float
+) -> void:
+	var mesh_inst := MeshInstance3D.new()
+	mesh_inst.name = "seg"
+	mesh_inst.mesh = _make_cylinder(length, radius)
+	mesh_inst.position = offset
+	mesh_inst.material_override = _limb_mat
+	_attach(bone_name).add_child(mesh_inst)
+
+
+func _add_head(style: Dictionary, radius: float) -> void:
+	var attach := _attach("head")
+
+	var head := MeshInstance3D.new()
+	head.name = "head"
+	var head_size: float = style["head_size"]
+	if str(style["head_shape"]) == "box":
+		var box := BoxMesh.new()
+		box.size = Vector3(head_size * 2.0, head_size * 2.0, head_size * 2.0)
+		head.mesh = box
+	else:
+		var sphere := SphereMesh.new()
+		sphere.radius = head_size
+		sphere.height = head_size * 2.0
+		sphere.radial_segments = 12
+		sphere.rings = 6
+		head.mesh = sphere
+	head.position = Vector3(0.0, head_size * 0.75, 0.0)   # 球底与颈杆重叠，头不会浮着
+	head.material_override = _head_mat
+	attach.add_child(head)
+
+	# 朝向标记：火柴人的杆是轴对称的，没有它就分不出面朝哪边。
+	var nose := MeshInstance3D.new()
+	nose.name = "nose"
+	var nose_box := BoxMesh.new()
+	var nose_size := head_size * 0.4
+	nose_box.size = Vector3(nose_size, nose_size, nose_size * 1.6)
+	nose.mesh = nose_box
+	nose.position = Vector3(0.0, head_size * 0.75, -head_size * 1.0)
+	nose.material_override = _limb_mat
+	attach.add_child(nose)
+
+
+## 样式 B 专属：胸前横带，让两套样式在远处也能一眼分开。
+## 注意符号：躯干从骨盆**向上**长，所以这里取正值（写成负值会落到膝盖上，曾踩过）。
+func _add_chest_band(radius: float) -> void:
+	_add_bar("spine", Vector3(0.0, SPINE_LEN * 0.62, 0.0), 0.30, radius * 0.9)
+
+
+## 每帧驱动步态。本机玩家传物理速度；替身传由收到的位置差分算出的速度。
+func animate(move_speed: float, grounded: bool, delta: float) -> void:
+	if _skeleton == null:
+		return
+
+	_air = move_toward(_air, 0.0 if grounded else 1.0, delta * AIR_BLEND_RATE)
+
+	var target_amp := 0.0
+	if grounded and move_speed > WALK_THRESHOLD:
+		target_amp = clampf(move_speed / STEP_SPEED_FULL, STEP_AMP_MIN, 1.0)
+	_amp = move_toward(_amp, target_amp, delta * AMP_RATE)
+
+	# 停下时摆幅衰减到 0，相位随之停住，姿态自然回到直立。
+	if _amp > 0.01:
+		_phase += delta * (STEP_FREQ_BASE + move_speed * STEP_FREQ_PER_SPEED)
+
+	var swing := sin(_phase)
+	var lift := absf(sin(_phase))
+
+	# 走路姿态。骨骼沿 -Y 向下延伸，所以 rotation.x 为正 = 末端向前摆。
+	var leg_l := swing * LEG_SWING * _amp
+	var leg_r := -swing * LEG_SWING * _amp
+	# 膝盖只能向后弯（负值），而且弯在“蹬地之后收腿”的摆动期：
+	# sin(_phase) 为负就是腿在后半程，用 min(0, sin) 取到这一段。
+	var knee_l := minf(0.0, swing) * KNEE_BEND * _amp
+	var knee_r := minf(0.0, -swing) * KNEE_BEND * _amp
+	var arm_l := -swing * ARM_SWING * _amp
+	var arm_r := swing * ARM_SWING * _amp
+	var elbow := ELBOW_BEND * _amp
+	var bob := lift * BOB * _amp
+	# 躯干朝 +Y 延伸，rotation.x 为正 = 向后倒，所以前倾取负。
+	var lean := -TORSO_LEAN * _amp
+
+	# 空中姿态
+	leg_l = lerpf(leg_l, AIR_LEG_L, _air)
+	leg_r = lerpf(leg_r, AIR_LEG_R, _air)
+	knee_l = lerpf(knee_l, AIR_KNEE_L, _air)
+	knee_r = lerpf(knee_r, AIR_KNEE_R, _air)
+	arm_l = lerpf(arm_l, AIR_ARM, _air)
+	arm_r = lerpf(arm_r, AIR_ARM, _air)
+	elbow = lerpf(elbow, AIR_ELBOW, _air)
+	bob = lerpf(bob, 0.0, _air)
+	lean = lerpf(lean, -AIR_LEAN, _air)
+
+	_set_rot("upper_leg_l", leg_l)
+	_set_rot("upper_leg_r", leg_r)
+	_set_rot("lower_leg_l", knee_l)
+	_set_rot("lower_leg_r", knee_r)
+	_set_rot("upper_arm_l", arm_l)
+	_set_rot("upper_arm_r", arm_r)
+	_set_rot("lower_arm_l", elbow)
+	_set_rot("lower_arm_r", elbow)
+	_set_rot("spine", lean)
+	_set_rot("hips", 0.0)
+
+	var hips_idx: int = _bones.get("hips", -1)
+	if hips_idx >= 0:
+		_skeleton.set_bone_pose_position(hips_idx, Vector3(0.0, HIPS_HEIGHT + bob, 0.0))
+
+
+func _set_rot(bone_name: String, x: float) -> void:
+	var idx: int = _bones.get(bone_name, -1)
+	if idx < 0:
+		return
+	_skeleton.set_bone_pose_rotation(idx, Quaternion.from_euler(Vector3(x, 0.0, 0.0)))

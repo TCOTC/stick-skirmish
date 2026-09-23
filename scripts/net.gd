@@ -21,13 +21,11 @@ const PUBLISH_INTERVAL := 0.25  # 供自动化检查读取的间隔
 
 const SPAWN_Z := 9.0
 const SPAWN_X_OFFSET := 3.0
+# 替身判定为“在地面上”的高度阈值。场地是平的，脚底 y 约为 0，跳跃时才会明显抬高。
+const GROUND_Y_MAX := 0.3
 
-const AVATAR_COLORS: Array[Color] = [
-	Color(0.95, 0.45, 0.30),
-	Color(0.35, 0.85, 0.45),
-	Color(0.95, 0.80, 0.30),
-	Color(0.65, 0.45, 0.95),
-]
+# 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
+const StickFigureScript := preload("res://scripts/stick_figure.gd")
 
 var my_id := 0
 var connected := false
@@ -42,10 +40,14 @@ var _label: Label = null
 var _hud: CanvasLayer = null
 var _acc := 0.0
 var _pub_at := 0.0
-# 远端玩家：编号 → {pos: Vector3, yaw: float, at: float}
+# 自己的样式序号（按进入房间的顺序，0 是第一个进来的）
+var _my_rank := 0
+# 远端玩家：编号 → {pos, yaw, at, speed, grounded}
 var _targets: Dictionary = {}
-# 编号 → 替身节点
+# 编号 → 替身火柴人
 var _avatars: Dictionary = {}
+# 编号 → 已应用的样式序号（变了才重建外观）
+var _avatar_ranks: Dictionary = {}
 
 
 func _ready() -> void:
@@ -143,6 +145,7 @@ func _on_connected() -> void:
 	# 两个玩家都从 (0, 1, 9) 出生会完全重叠，按编号奇偶错开。
 	_player.global_position.x += SPAWN_X_OFFSET if (my_id % 2 == 0) else -SPAWN_X_OFFSET
 	print("[net] 出生点 ", _player.global_position)
+	_refresh_styles()
 
 
 func _find_player() -> Node3D:
@@ -171,36 +174,95 @@ func _peer_state(id: int, pos: Vector3, yaw: float) -> void:
 	if id == my_id or id <= 1:
 		return
 
+	var now := Time.get_ticks_msec() / 1000.0
 	var entry: Dictionary = _targets.get(id, {})
 	var first := entry.is_empty()
+
+	# 用两次收到的位置差算出速度，用来驱动替身的步态（平滑后的位置会掩盖真实速度）。
+	var speed := 0.0
+	var prev_at := float(entry.get("at", 0.0))
+	if prev_at > 0.0:
+		var moved: Vector3 = pos - (entry["pos"] as Vector3)
+		moved.y = 0.0
+		speed = moved.length() / maxf(0.001, now - prev_at)
+
 	entry["pos"] = pos
 	entry["yaw"] = yaw
-	entry["at"] = Time.get_ticks_msec() / 1000.0
+	entry["at"] = now
+	entry["speed"] = speed
+	entry["grounded"] = pos.y < GROUND_Y_MAX
 	_targets[id] = entry
 
 	if first:
 		print("[net] 见到玩家 ", id)
 		_avatars[id] = _make_avatar(id, pos, yaw)
+		_refresh_styles()
 
 
-func _make_avatar(id: int, pos: Vector3, yaw: float) -> MeshInstance3D:
-	var mesh_inst := MeshInstance3D.new()
-	var capsule := CapsuleMesh.new()
-	capsule.radius = 0.4
-	capsule.height = 1.8
-	mesh_inst.mesh = capsule
-
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = AVATAR_COLORS[id % AVATAR_COLORS.size()]
-	mesh_inst.material_override = mat
+## 替身也是火柴人：脚底对齐玩家原点，所以位置不加偏移。
+func _make_avatar(id: int, pos: Vector3, yaw: float) -> Node3D:
+	var avatar: Node3D = StickFigureScript.new()
+	avatar.name = "Remote%d" % id
 
 	var scene := get_tree().current_scene
 	if scene == null:
 		scene = self
-	scene.add_child(mesh_inst)
-	mesh_inst.global_position = pos + Vector3(0.0, 0.9, 0.0)
-	mesh_inst.rotation.y = yaw
-	return mesh_inst
+	scene.add_child(avatar)
+	avatar.global_position = pos
+	avatar.rotation.y = yaw
+	return avatar
+
+
+## 样式按“进入房间的顺序”分配。
+##
+## 中继下发的编号是全局递增的，所以同一房间内编号的大小关系就是先后顺序。
+## 把已知编号排序，各自的位次就是它的序号——两个客户端算出来的结果一致。
+func _refresh_styles() -> void:
+	var ids := _known_ids()
+	ids.sort()
+
+	for id in _targets:
+		var rank := ids.find(id)
+		if rank < 0:
+			rank = 0
+		if int(_avatar_ranks.get(id, -1)) == rank:
+			continue
+		_avatar_ranks[id] = rank
+		var avatar: Node3D = _avatars.get(id)
+		if avatar != null:
+			avatar.apply_style(rank)
+
+	var my_rank := ids.find(my_id)
+	if my_rank < 0:
+		my_rank = 0
+	if my_rank != _my_rank:
+		_my_rank = my_rank
+		_apply_my_style()
+
+
+func _apply_my_style() -> void:
+	var figure := _my_figure()
+	if figure != null:
+		figure.apply_style(_my_rank)
+
+
+func _my_figure() -> Node:
+	if _player == null:
+		_player = _find_player()
+	if _player == null:
+		return null
+	return _player.get_node_or_null("Figure")
+
+
+## 自己 + 所有已知对端的编号。
+func _known_ids() -> Array:
+	var ids: Array = []
+	if my_id > 0:
+		ids.append(my_id)
+	for id in _targets:
+		if not ids.has(id):
+			ids.append(id)
+	return ids
 
 
 func _expire_peers() -> void:
@@ -211,25 +273,31 @@ func _expire_peers() -> void:
 	for id in _targets:
 		if now - float(_targets[id]["at"]) > PEER_TIMEOUT:
 			gone.append(id)
+	if gone.is_empty():
+		return
 	for id in gone:
 		_targets.erase(id)
+		_avatar_ranks.erase(id)
 		var avatar = _avatars.get(id)
 		if avatar != null:
 			avatar.queue_free()
 		_avatars.erase(id)
 		print("[net] 玩家 ", id, " 超时离开")
+	_refresh_styles()
 
 
 func _smooth_avatars(delta: float) -> void:
 	var weight := 1.0 - exp(-SMOOTH_RATE * delta)
 	for id in _targets:
-		var avatar = _avatars.get(id)
+		var avatar: Node3D = _avatars.get(id)
 		if avatar == null:
 			continue
 		var entry: Dictionary = _targets[id]
-		var target: Vector3 = entry["pos"] + Vector3(0.0, 0.9, 0.0)
-		avatar.global_position = avatar.global_position.lerp(target, weight)
+		avatar.global_position = avatar.global_position.lerp(entry["pos"], weight)
 		avatar.rotation.y = lerp_angle(avatar.rotation.y, float(entry["yaw"]), weight)
+		avatar.animate(
+			float(entry.get("speed", 0.0)), bool(entry.get("grounded", true)), delta
+		)
 
 
 ## 界面文字一律用英文：Godot 默认字体不含中日韩字形，中文会显示成空白方块。
@@ -245,21 +313,49 @@ func _update_hud() -> void:
 		_label.add_theme_color_override("font_color", Color(0.72, 0.86, 1.0))
 		_hud.add_child(_label)
 
-	var text := "room=%s  me=%d  %s" % [room, my_id, status]
+	var text := "room=%s  me=%d  rank=%d  %s" % [room, my_id, _my_rank, status]
 	if connected and not _targets.is_empty():
 		text += "  others=%s" % str(_targets.keys())
 	_label.text = text
 
 
-## 供 tools/net-probe-check.mjs 读取，方便自动化验证"两边都看见了对方"。
+## 供 tools/net-probe-check.mjs 读取，方便自动化验证"两边都看见了对方"以及样式分配。
+## 关节角度也一并输出：试着走动时可以看到这两个数在变，能区分"角色在动"与"腿部在摆"。
 func _publish() -> void:
+	var ranks := {}
+	for id in _avatar_ranks:
+		ranks[str(id)] = _avatar_ranks[id]
+
+	var figure_info := {}
+	var figure := _my_figure()
+	if figure != null:
+		figure_info = {
+			"style": _style_name(_my_rank),
+			"legAngle": snappedf(figure.bone_angle("upper_leg_l"), 0.001),
+			"armAngle": snappedf(figure.bone_angle("upper_arm_l"), 0.001),
+		}
+
+	var pos := Vector3.ZERO
+	if _player != null:
+		pos = _player.global_position
+
 	var snapshot := {
 		"room": room,
 		"url": url,
 		"myId": my_id,
+		"myRank": _my_rank,
+		"myStyle": _style_name(_my_rank),
 		"connected": connected,
 		"status": status,
 		"peers": _targets.keys(),
+		"peerRanks": ranks,
 		"avatars": _avatars.size(),
+		"figure": figure_info,
+		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
 	}
 	JavaScriptBridge.eval("window.__netstat = " + JSON.stringify(snapshot))
+
+
+func _style_name(rank: int) -> String:
+	var styles: Array = StickFigureScript.STYLES
+	return str(styles[((rank % styles.size()) + styles.size()) % styles.size()]["name"])
