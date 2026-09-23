@@ -1128,6 +1128,14 @@ async function checkScore() {
   const yawBack = a2 ? Math.abs(angleDiff(a2.figure.bodyYawDeg, spawnYawA)) : 999;
   const resetScoresA = a2?.match?.scores ?? {};
 
+  // 替身实际画在哪 vs 收到的目标点。两者差得大就说明还在平滑滑行——
+  // 回合重置是瞬间换位置的，那段距离必须走瞬移分支。
+  const peerIdB2 = b2 ? String(b2.myId) : "";
+  const avatarLag = a2?.avatarPos?.[peerIdB2] && a2?.peerPos?.[peerIdB2]
+    ? flatDist(a2.avatarPos[peerIdB2], a2.peerPos[peerIdB2]) : 999;
+  const avatarFromSpawn = a2?.avatarPos?.[peerIdB2]
+    ? flatDist(a2.avatarPos[peerIdB2], ready.sb.pos) : 999;
+
   console.log("");
   if (!scored) console.log("  ⚠ 没等到记分事件，后面的结论按“未发生”判定。");
   if (!reset) console.log("  ⚠ 没等到下一回合，后面的结论按“未发生”判定。");
@@ -1167,6 +1175,10 @@ async function checkScore() {
       `alpha round=${a2?.match?.round ?? "-"} / beta round=${b2?.match?.round ?? "-"}`],
     ["重置把人送回出生点", posBack < 0.6, `离出生点 ${posBack.toFixed(2)} 米`],
     ["重置恢复开局朝向", yawBack < 3.0, `与开局朝向差 ${yawBack.toFixed(1)}°`],
+    ["重置把对方替身也送回出生点", avatarFromSpawn < 0.8,
+      `替身离对方出生点 ${avatarFromSpawn.toFixed(2)} 米`],
+    ["替身是瞬移过去的（不在半路滑行）", avatarLag < 0.35,
+      `替身与收到的目标点差 ${avatarLag.toFixed(2)} 米`],
     ["重置后血量回满且复活", (a2?.health ?? 0) === 100, `血量 ${a2?.health ?? "-"}`],
     ["下一回合横幅显示 ROUND 2", /ROUND 2/.test(a2?.hud?.banner ?? ""),
       `横幅 "${a2?.hud?.banner ?? ""}"`],

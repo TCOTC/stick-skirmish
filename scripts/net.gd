@@ -24,6 +24,13 @@ const DEFAULT_MAX_HP := 100
 # 默认碰撞层是 1，走到一起会互相卡住；而射线默认掩码包含所有层，所以曳光能停在替身上。
 const AVATAR_COLLISION_LAYER := 3
 
+## 目标位置离替身当前这么远（米）时直接瞬移，不做平滑。
+##
+## 回合重置与重生会让对方**瞬间**换位置，而平滑那些距离的表现是“横穿整个场地滑过去”，
+## 比瞬移更奇怪。同理，朝向差超过 TELEPORT_YAW_DEG 度时也不做插值，否则会转一大圈。
+const TELEPORT_DIST := 3.0
+const TELEPORT_YAW_DEG := 75.0
+
 const SPAWN_Z := 9.0
 const SPAWN_X_OFFSET := 3.0
 # 替身判定为“在地面上”的高度阈值。场地是平的，脚底 y 约为 0，跳跃时才会明显抬高。
@@ -389,8 +396,17 @@ func _smooth_avatars(delta: float) -> void:
 		if avatar == null:
 			continue
 		var entry: Dictionary = _targets[id]
-		avatar.global_position = avatar.global_position.lerp(entry["pos"], weight)
-		avatar.rotation.y = lerp_angle(avatar.rotation.y, float(entry["yaw"]), weight)
+		var target: Vector3 = entry["pos"]
+		if avatar.global_position.distance_to(target) > TELEPORT_DIST:
+			# 瞬移（回合重置、重生）：平滑在这里只会变成一段奇怪的滑行
+			avatar.global_position = target
+		else:
+			avatar.global_position = avatar.global_position.lerp(target, weight)
+		var yaw := float(entry["yaw"])
+		if absf(rad_to_deg(angle_difference(avatar.rotation.y, yaw))) > TELEPORT_YAW_DEG:
+			avatar.rotation.y = yaw
+		else:
+			avatar.rotation.y = lerp_angle(avatar.rotation.y, yaw, weight)
 		avatar.aim_pitch = float(entry.get("pitch", 0.0))
 		avatar.animate(
 			float(entry.get("speed", 0.0)), bool(entry.get("grounded", true)), delta,
@@ -466,6 +482,13 @@ func _publish() -> void:
 		var p: Vector3 = _targets[id]["pos"]
 		peer_pos[str(id)] = [snappedf(p.x, 0.01), snappedf(p.y, 0.01), snappedf(p.z, 0.01)]
 
+	# 替身**实际画在**哪里。它与 peerPos（收到的目标点）之差就是平滑的滞后；
+	# 回合重置之后两者应当几乎重合（那时走的是瞬移分支，不是平滑）。
+	var avatar_pos := {}
+	for id in _avatars:
+		var a: Vector3 = _avatars[id].global_position
+		avatar_pos[str(id)] = [snappedf(a.x, 0.01), snappedf(a.y, 0.01), snappedf(a.z, 0.01)]
+
 	var shots := 0
 	if _player != null and "shots_fired" in _player:
 		shots = int(_player.get("shots_fired"))
@@ -529,6 +552,7 @@ func _publish() -> void:
 		"peerRanks": ranks,
 		"peerNames": _peer_names(),
 		"peerPos": peer_pos,
+		"avatarPos": avatar_pos,
 		"avatars": _avatars.size(),
 		"avatarYawDeg": avatar_yaw,
 		"avatarDecor": decor,
