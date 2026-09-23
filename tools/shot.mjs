@@ -62,6 +62,13 @@ function keyInfo(name) {
 }
 // 可选：附加查询串，例如 cam=front（把相机转到角色正面核对面部）
 const QUERY = opt("query", "");
+// 可选：打印一块像素的灰度矩阵，格式 "x,y,宽,高"。
+//
+// 【为什么要它】`Page.captureScreenshot` 的 scale 是**带插值**的：放大 16 倍会把
+// 一个 1 像素的点摊成一团渐变，根本看不出“到底占几个像素”。所以核对准星中心点、
+// 描边宽度这类像素级的量时，要看原始灰度值。
+// 解码交给页面自己（createImageBitmap + OffscreenCanvas），不需要引入图像库。
+const PIXELS = opt("pixels", "");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -263,6 +270,31 @@ try {
     console.log(`  居中裁剪: ${zoomClip.join(",")}（当前视口 ${vw}x${vh}）`);
   }
   await shot(zoomFile, zoomClip);
+
+  if (PIXELS) {
+    const [px, py, pw, ph] = PIXELS.split(",").map(Number);
+    const full = await cdp.send("Page.captureScreenshot", { format: "png" });
+    const expr = `(async () => {
+      const blob = await (await fetch("data:image/png;base64," + ${JSON.stringify(full.data)})).blob();
+      const bmp = await createImageBitmap(blob);
+      const c = new OffscreenCanvas(bmp.width, bmp.height);
+      const g = c.getContext("2d");
+      g.drawImage(bmp, 0, 0);
+      const d = g.getImageData(${px}, ${py}, ${pw}, ${ph}).data;
+      const out = [];
+      for (let i = 0; i < d.length; i += 4) out.push(Math.round((d[i] + d[i + 1] + d[i + 2]) / 3));
+      return JSON.stringify({ w: bmp.width, h: bmp.height, px: out });
+    })()`;
+    const res = await cdp.send("Runtime.evaluate", {
+      expression: expr, awaitPromise: true, returnByValue: true,
+    });
+    const got = JSON.parse(res.result.value);
+    console.log(`  像素 ${px},${py} ${pw}x${ph}（画布 ${got.w}x${got.h}，0 是黑、255 是白）:`);
+    for (let y = 0; y < ph; y++) {
+      const row = got.px.slice(y * pw, (y + 1) * pw).map((v) => String(v).padStart(3));
+      console.log(`    y=${String(py + y).padStart(4)} | ${row.join(" ")}`);
+    }
+  }
 
   if (HOLD_KEY) {
     const keys = HOLD_KEY.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);

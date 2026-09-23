@@ -7,13 +7,16 @@
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --walk     # 走路时关节有没有在动
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --shoot    # 能否打中对方并扣血
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --score    # 记分、判胜负与下一回合
+ *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --rejoin   # 两台设备分别刷新后还能看见对方
  *
  * 探针模式跑 scripts/net_probe.gd（需 ?probe=1），检查 wss 连接、中继转发、
  * Godot 高层 API 与广播 rpc；房间模式跑 scripts/net.gd，检查两个客户端进入同一房间后
  * 互相看到对方的替身与样式分配；走路模式注入真实的鼠标点击与键盘事件，
  * 读取火柴人的关节角度与自身位置，验证“走路时腿真的在摆、人真的在动”；
  * 射击模式把 alpha 转向 beta、开火，验证命中的判定与扣血真的发生在被打者身上；
- * 记分模式用 ?kills=1 把一局压缩到几秒，验证记分、胜负横幅与下一回合的重置。
+ * 记分模式用 ?kills=1 把一局压缩到几秒，验证记分、胜负横幅与下一回合的重置；
+ * 刷新重连模式按“一台先刷、另一台还连着”的次序逐个刷新页面，
+ * 验证新进程与旧进程仍能互相看见（这条路径 --room 覆盖不到，它只测同时启动）。
  *
  * 环境变量：
  *   NET_SHOT_DIR      每个实例收尾时把画面截图写到这个目录（用来人眼核对）
@@ -41,12 +44,16 @@ const MODE = ARG === "--room" ? "room"
   : ARG === "--shoot" ? "shoot"
   : ARG === "--score" ? "score"
   : ARG === "--fire" ? "fire"
+  : ARG === "--rejoin" ? "rejoin"
   : "probe";
 const ROOM_NAME = process.env.TEST_ROOM ?? "roomtest";
 const WALK_ROOM = process.env.WALK_ROOM ?? "walktest";
 const SHOOT_ROOM = process.env.SHOOT_ROOM ?? "shoottest";
 const SCORE_ROOM = process.env.SCORE_ROOM ?? "scoretest";
 const FIRE_ROOM = process.env.FIRE_ROOM ?? "firetest";
+const REJOIN_ROOM = process.env.REJOIN_ROOM ?? "rejointest";
+// 刷新之后页面要重新加载 wasm 并连上中继，比普通等待宽得多。
+const RELOAD_TIMEOUT_MS = Number(process.env.RELOAD_TIMEOUT_MS ?? 120_000);
 const SHOT_DIR = process.env.NET_SHOT_DIR ?? "";
 // 让第二个实例晚一点再加入，用来复现"一个人先开、另一个人后进"的真实场景。
 //
@@ -590,6 +597,7 @@ const PAGE_QUERY = {
   shoot: `?room=${encodeURIComponent(SHOOT_ROOM)}&kills=99`,
   score: `?room=${encodeURIComponent(SCORE_ROOM)}&kills=1`,
   fire: `?room=${encodeURIComponent(FIRE_ROOM)}&kills=99`,
+  rejoin: `?room=${encodeURIComponent(REJOIN_ROOM)}`,
 };
 const pageQuery = PAGE_QUERY[MODE] ?? null;
 
@@ -599,6 +607,7 @@ const MODE_LABEL = {
   shoot: `射击命中（room=${SHOOT_ROOM}）`,
   score: `记分与回合（room=${SCORE_ROOM}，1 杀定胜负）`,
   fire: `开火扳机（room=${FIRE_ROOM}，复现被吞掉的 mouseup）`,
+  rejoin: `刷新重连（room=${REJOIN_ROOM}，两台设备分别刷新）`,
   probe: "传输层探针",
 }[MODE];
 
@@ -687,6 +696,8 @@ try {
     await checkScore();
   } else if (MODE === "fire" && injected) {
     await checkFire();
+  } else if (MODE === "rejoin" && injected) {
+    await checkRejoin();
   } else if (MODE === "probe") {
     await checkProbe();
   } else if (!injected) {
@@ -1076,6 +1087,8 @@ async function checkShoot() {
   // 静止时的准星间距（散布在最小值的状态），用来对比“开火时张开了多少”
   const baseGap = ready.sa.hud?.crosshairGap ?? 0;
   const centerSize = ready.sa.hud?.crosshairCenter ?? 0;
+  const centerOffsetX = ready.sa.hud?.crosshairOffsetX ?? 99;
+  const centerOffsetY = ready.sa.hud?.crosshairOffsetY ?? 99;
 
   const idA = ready.sa.myId;
   const idB = ready.sb.myId;
@@ -1146,6 +1159,9 @@ async function checkShoot() {
       `准星间距 ${baseGap} → ${standBurst.maxGap} 像素（散布 ${spreadMin}° → ${standBurst.maxSpread.toFixed(2)}°）`],
     ["准星中心是小点、不挡视野", centerSize > 0 && centerSize <= 4.0,
       `中心点 ${centerSize} 像素（曾经是 6 像素的实心方块）`],
+    ["准星中心真的在屏幕正中（偏移 ≤ 0.5 像素）",
+      Math.abs(centerOffsetX) <= 0.5 && Math.abs(centerOffsetY) <= 0.5,
+      `偏移 ${centerOffsetX} / ${centerOffsetY} 像素（用户报过“位置偏移”：3 像素方块落在半像素上）`],
     ["准星中心与刻度分得开（不会并成一块）", baseGap - centerSize / 2 >= 1.0,
       `间隙 ${(baseGap - centerSize / 2).toFixed(1)} 像素（间距 ${baseGap}、中心半径 ${centerSize / 2}）`],
     ["打中对方后开枪方出现命中提示", (finalA?.hud?.hitmarkers ?? 0) > 0,
@@ -1715,6 +1731,143 @@ async function checkFire() {
     for (const line of cdp.console.slice(-20)) console.log(`    ${line}`);
     for (const line of cdp.exceptions.slice(-5)) console.log(`    EXCEPTION ${line}`);
   }
+}
+
+/**
+ * 直接以客户端身份问中继一句“这个房间里现在有谁”。
+ *
+ * 两件事要注意：
+ *   1. 中继与网页共用一张自签证书，而 Node 的 WebSocket 客户端会拒绝自签证书，
+ *      所以 https 时先试 wss、失败再退到那个**共用同一个中继**的明文 ws 端口（port-1）；
+ *   2. 这只是诊断用的旁观连接，它也在房间里占一个名额，问完立刻关掉。
+ */
+async function relayWhoami(room) {
+  const host = BASE.replace(/^https?:\/\//, "").replace(/\/$/, "");
+  const hostOnly = host.replace(/:\d+$/, "");
+  const port = Number(host.match(/:(\d+)$/)?.[1] ?? 0);
+  const candidates = [
+    `${BASE.replace(/^http/, "ws")}/ws/${encodeURIComponent(room)}`,
+    port > 0 ? `ws://${hostOnly}:${port - 1}/ws/${encodeURIComponent(room)}` : null,
+  ].filter(Boolean);
+
+  for (const wsUrl of candidates) {
+    const text = await new Promise((resolve) => {
+      const ws = new WebSocket(wsUrl);
+      const done = (value) => {
+        try { ws.close(); } catch { /* 忽略 */ }
+        resolve(value);
+      };
+      const timer = setTimeout(() => done(null), 4000);
+      ws.addEventListener("open", () => ws.send("relay:whoami"));
+      ws.addEventListener("message", (event) => {
+        const line = String(event.data);
+        if (line.startsWith("relay:hello")) {
+          clearTimeout(timer);
+          done(line.trim());
+        }
+      });
+      ws.addEventListener("error", () => {
+        clearTimeout(timer);
+        done(null);
+      });
+    });
+    if (text) return text;
+  }
+  return "(问不到中继)";
+}
+
+/**
+ * 刷新重连模式：复现“两台设备分别刷新之后，一边看得见对方、另一边只看得见自己”。
+ *
+ * 【为什么单独开一个模式】`--room` 让两个实例**同时**从头启动，双方都是刚连上的新进程，
+ * 于是那条路径永远正常。真实玩法里是“一台先刷新、另一台还连着”，
+ * 这个时序才是出问题的地方，所以这里按用户的做法逐个刷新，每次都要求双方仍互相看见。
+ */
+async function checkRejoin() {
+  const byName = (name) => instances.find((i) => i.name === name);
+  const states = {};
+
+  const snapshot = async () => {
+    for (const inst of instances) {
+      const s = await readStat(inst.cdp);
+      if (s) states[inst.name] = s;
+    }
+  };
+
+  /** 等双方都连上、并且各自看到对方的**当前**编号与替身。 */
+  const waitMutual = async () => waitFor(async () => {
+    await snapshot();
+    const a = states.alpha;
+    const b = states.beta;
+    if (!a?.connected || !b?.connected) return null;
+    if (!a.peers.includes(b.myId) || !b.peers.includes(a.myId)) return null;
+    if (a.avatars < 1 || b.avatars < 1) return null;
+    return true;
+  }, RELOAD_TIMEOUT_MS, 500);
+
+  /** 一句话描述两边各自“看到了谁”，失败时靠它定位是哪一边瞎了。 */
+  const describe = () => {
+    const a = states.alpha ?? {};
+    const b = states.beta ?? {};
+    return `alpha(id=${a.myId ?? "-"} ${a.status ?? "-"} peers=${JSON.stringify(a.peers ?? [])} 替身=${a.avatars ?? "-"})`
+      + ` / beta(id=${b.myId ?? "-"} ${b.status ?? "-"} peers=${JSON.stringify(b.peers ?? [])} 替身=${b.avatars ?? "-"})`;
+  };
+
+  const failed = await waitMutual();
+  const results = [
+    ["开局：双方互相看见", failed === true, describe()],
+  ];
+  console.log(`  结论（开局）: ${results[0][1] ? "✓" : "✗"} ${describe()}`);
+
+  const phases = [
+    { label: "只刷新 alpha（beta 还连着）", reload: ["alpha"] },
+    { label: "只刷新 beta（alpha 还连着）", reload: ["beta"] },
+    { label: "两边都刷新（先 alpha 后 beta）", reload: ["alpha", "beta"] },
+  ];
+
+  for (const phase of phases) {
+    const idsBefore = {};
+    for (const inst of instances) idsBefore[inst.name] = states[inst.name]?.myId;
+    for (const who of phase.reload) {
+      delete states[who];
+      console.log(`  ${who} 刷新页面…`);
+      await byName(who).cdp.send("Page.navigate", { url: `${BASE}/index.html${pageQuery}` });
+      // 让新进程先起一段，避免两次刷新叠在一起（用户是“分别刷新”，不是同时按 F5）。
+      await sleep(2000);
+    }
+    const seen = await waitMutual();
+    // 刷新过的一方必然是**新连接**（新编号），没刷新的必须还是原来那个编号。
+    const idOk = phase.reload.every((who) => states[who]?.myId !== idsBefore[who])
+      && instances
+        .map((i) => i.name)
+        .filter((who) => !phase.reload.includes(who))
+        .every((who) => states[who]?.myId === idsBefore[who]);
+    const errs = instances.reduce((sum, i) => sum + rpcErrorCount(i.cdp), 0);
+    results.push([
+      `${phase.label}：刷新后双方仍互相看见`,
+      seen === true && idOk,
+      `${describe()}；编号变化=${idOk ? "符合" : "不符合"}，握手/缓存报错=${errs} 条`,
+    ]);
+    for (const inst of instances) {
+      const lines = inst.cdp.console.filter((l) => RPC_ERROR.test(l));
+      if (lines.length) console.log(`    ${inst.name} 报了 ${lines.length} 条: ${lines[lines.length - 1]}`);
+    }
+    if (seen !== true) {
+      console.log(`    中继那边的房间名单: ${await relayWhoami(REJOIN_ROOM)}`);
+      for (const inst of instances) {
+        console.log(`    ${inst.name} 日志末 6 条:`);
+        for (const line of inst.cdp.console.slice(-6)) console.log(`      ${line}`);
+      }
+    }
+  }
+
+  console.log("");
+  console.log("  结论:");
+  for (const [label, ok, detail] of results) {
+    console.log(`  ${ok ? "✓" : "✗"} ${label} — ${detail}`);
+  }
+  console.log("");
+  if (results.some(([, ok]) => !ok)) process.exitCode = 1;
 }
 
 /** 房间模式：两边都得连上，并且各自看到对方的编号与替身。 */

@@ -70,7 +70,12 @@
 node tools/shot.mjs                                              # 整屏 + 中央放大（写到系统临时目录）
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\a.png --stat     # 同时输出游戏状态
 node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\w.png --key w --center 150,230,30   # 按住 W 拍走路姿态
+node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\c.png --pixels 624,278,11,11       # 打印一块像素的灰度
 ```
+
+`--pixels` 用页面自己解码截图读原始灰度（不需要图像库）。**放大截图看不出像素级的量**：
+`Page.captureScreenshot` 的 `scale` 带插值，一个 1 像素的点会被摊成一团渐变。
+核对准星中心点、描边宽度这类问题时用它。
 
 输出路径**不要写进项目目录**（会被 Godot 当资源导出，见下方“已经踩过的坑”）。
 
@@ -97,7 +102,22 @@ node tools/net-probe-check.mjs https://127.0.0.1:8001 --walk
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --shoot
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --score   # 记分/判胜负/下一回合（?kills=1）
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --fire    # 开火扳机（复现被吞掉的 mouseup）
+node tools/net-probe-check.mjs https://127.0.0.1:8001 --rejoin  # 两台设备“分别刷新”后还能看见对方
 ```
+
+`--rejoin` 测的是 `--room` 盖不到的时序：后者让两个实例同时从头启动（双方都是空缓存，
+那条路径永远正常），前者按“只刷 alpha / 只刷 beta / 两边都刷”逐个刷新。
+它失败时会直接向中继问一句房间名单，用来区分“中继没转发”与“客户端丢包”。
+
+### 联机传输层的约束（改同步前必读）
+
+**不要用 `rpc()` 传游戏状态。** Godot 的节点路径缓存是**按对端**缓存的：第一次发完整路径，
+对端确认后只发路径编号。而中继把所有包都标成“来自 1 号”，于是“对端”只有一个、缓存也只有一份。
+任何一方刷新页面之后，新进程的缓存是空的，而对方仍旧只发编号 → 新进程把**每一个包**都丢掉，
+而且不会自愈（症状：“一台看得到对方，刷新过的那台只看得见自己”）。
+现在走 `MultiplayerAPI.send_bytes()` + `SceneMultiplayer.peer_packet`（原始字节，没有路径），
+消息类型是载荷的第一个数（`net.gd` 的 `MSG_*`）。
+注意：`peer_packet` **不在基类 `MultiplayerAPI` 上**，要 `as SceneMultiplayer` 才能连。
 
 `NET_SHOT_DIR=<目录>` 会把每个实例的画面存下来（含开火中整屏 + 准星放大，
 以及回合结算那一刻的整屏 + **倒地放大**——倒地姿态整屏看不清），
@@ -363,6 +383,13 @@ CDP 测试的两个坑：
   `_attach_gun()` 里要再扫一次（症状只是“多了几个影子”，靠看截图很难发现）。
 - **`const` 可以引用预载脚本里的常量**：`STYLES` 里的颜色直接写 `Ink.INK` 可行
   （已实测），所以调色板不需要为“常量表”再拄一份。
+- **不要用 `rpc()` 传游戏状态。** 节点路径缓存按“对端”缓存，而中继把所有包标成来自 1 号 →
+  刷新过的一方永远收不到对方的包（`ID 1 not found in cache of peer 1`）。改走 `send_bytes()`
+  + `peer_packet`（详见 README「踩过的坑：rpc 的节点路径缓存」），并用 `--rejoin` 守着。
+- **小图形要按整像素对齐，否则看起来就是“偏了”。** 3 像素的准星中心配 ±1.5 的偏移落在
+  半像素上，光栅化会把它摊成 3～4 个带半覆盖的像素。现在中心取 1 像素、由
+  `_align_crosshair()` 对齐到整像素（视口尺寸变了要重算，全屏会改尺寸）。
+  注意“居中”在偶数宽度下只能做到 ±0.5 像素（正中落在两个像素的边界上）。
 - **细线必须开 MSAA**：`msaa_3d` 是枚举（0 关 / 1 是 2x / 2 是 4x），
   线稿风格不开的话远处的棱线会碎成虚线。- **点击画面会触发全屏，视口尺寸随之改变**（无头实测 1258x566 → 800x544），
   写死的截图裁剪坐标会捕空。要按当前视口算，或直接用 `shot.mjs --center`。

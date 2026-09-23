@@ -5,6 +5,9 @@ extends Node
 ## 原因是中继把收到的每个包都标记为来自 1 号（见 README「联机」），
 ## 发送方身份无法获知，rpc_id 与 peer 可见性都不可靠。
 ##
+## 数据包走 **原始字节**（`send_bytes()` + `peer_packet` 信号）而不是高层 `rpc()`，
+## 原因见下面 MSG_* 那段注释：rpc 的节点路径缓存会让“刷新过的那一方”从此收不到包。
+##
 ## 房间由网址参数决定：?room=xxx，默认 game。两台设备必须用同一个房间名。
 ## 同一台机器开两个标签页也能看到替身，可以单独验证同步。
 ##
@@ -19,6 +22,26 @@ const SMOOTH_RATE := 14.0   # 替身位置平滑速度
 const PUBLISH_INTERVAL := 0.25  # 供自动化检查读取的间隔
 const FIRE_RANGE := 200.0   # 复现别人弹道时的射线长度
 const DEFAULT_MAX_HP := 100
+
+# --- 消息类型 ---------------------------------------------------------------
+#
+# 【为什么不用 rpc()】Godot 的高层 rpc 会给节点路径做**按对端**的缓存：第一次发送时带上
+# 完整路径，等到对端的 CONFIRM 之后只发一个路径编号。而这里所有数据包都被中继标成
+# “来自 1 号”，于是“对端”永远只有 1 号这一个。任何一方刷新页面之后，新进程的路径缓存
+# 是空的，而对方仍旧只发编号，新进程查不到缓存就把**每一个包**都丢掉：
+#
+#     ERROR: ID 1 not found in cache of peer 1.
+#     ERROR: Invalid packet received. Requested node was not found.
+#
+# 而且它不会自愈：旧进程的缓存里那条记录已经被确认，再也不会重发完整路径。
+# 实测症状正是用户报的那个：一台设备看得到对方，刷新过的另一台只看得见自己
+# （`tools/net-probe-check.mjs --rejoin` 就是它的复现，修之前每个包都报错）。
+#
+# 原始字节里没有节点路径，所以没有这个问题；顺带也不再依赖 @rpc 注解与两侧节点路径一致。
+const MSG_STATE := 1     # 状态：编号、位置、朝向、俯仰、下蹲、比分、是否活着
+const MSG_FIRE := 2      # 开枪：开枪者、枪口、方向
+const MSG_KILL := 3      # 击杀：死者、凶手
+const MSG_HEALTH := 4    # 血量变化：编号、血量
 
 # 替身放在第 3 碰撞层：**只给射线用，不做物理阻挡**。
 # 默认碰撞层是 1，走到一起会互相卡住；而射线默认掩码包含所有层，所以曳光能停在替身上。
@@ -104,6 +127,14 @@ func _start_client() -> void:
 	_api.multiplayer_peer = _peer
 	# Node.multiplayer 是只读的，只能通过 SceneTree 把 API 注册到本节点路径上。
 	get_tree().set_multiplayer(_api, get_path())
+
+	# peer_packet 只在 SceneMultiplayer 上（基类 MultiplayerAPI 没有这个信号）。
+	# 默认接口就是它；万一不是，那收不到原始包，只能报出来而不是静默失效。
+	var scene_api := _api as SceneMultiplayer
+	if scene_api != null:
+		scene_api.peer_packet.connect(_on_peer_packet)
+	else:
+		push_warning("[net] 默认联机接口不是 SceneMultiplayer，收不到原始数据包")
 
 	# 握手超时默认只有 3 秒，而它从“创建客户端”那一刻就开始数了：
 	# 如果首帧渲染耗时超过 3 秒（软件渲染、低端设备、冷启动都容易发生），
@@ -199,14 +230,52 @@ func _send_state(delta: float) -> void:
 	if _acc < TICK:
 		return
 	_acc = 0.0
-	# 广播：中继不做定向，rpc() 默认就是发给所有对端。
+	# 广播：中继不做定向，所以直接交给所有人。
 	# 发的是**视觉朝向**（火柴人面朝哪边），不是 player.rotation.y（镜头朝向）：
 	# 本地火柴人跟着移动方向转，发镜头朝向的话双方看到的脸就不一致了。
 	# kills/deaths 也一并带上，但接收方**只在第一次见到这个编号时**用它补种比分
 	# （见 match.gd 的文件头），之后比分只跟击杀事件走。
 	# **alive 必须带**：对方倒地后要能看到他躺下（躺姿由这个布尔值派生，见 stick_figure）。
-	rpc("_peer_state", my_id, _player.global_position, _visual_yaw(), _visual_pitch(),
-		_visual_crouch(), Match.my_kills(), Match.my_deaths(), _visual_alive())
+	_send(MSG_STATE, [my_id, _player.global_position, _visual_yaw(), _visual_pitch(),
+		_visual_crouch(), Match.my_kills(), Match.my_deaths(), _visual_alive()])
+
+
+## 发一条消息给房间里的所有人（编号 0 = 广播，见 `MultiplayerAPI.send_bytes`）。
+##
+## 载荷用 `var_to_bytes` 打包：Vector3 / float / int / bool 都是 Variant 原生类型，
+## 收到的那一侧 `bytes_to_var` 能原样解回来（它不做对象反序列化）。
+func _send(msg_type: int, payload: Array) -> void:
+	if _api == null or _peer == null or not connected or my_id <= 0:
+		return
+	_api.send_bytes(var_to_bytes([msg_type] + payload), 0, MultiplayerPeer.TRANSFER_MODE_RELIABLE)
+
+
+## 收到一个原始包。中继把每个包都标成“来自 1 号”，所以发送者只能从载荷里读。
+##
+## 每一项都先查数组长度再取值：包在中继那里是原样转发的，长度不对时只能丢掉，
+## 不能让它把索引越界的错误刷到控制台（那会把真正的错误淹掉）。
+func _on_peer_packet(_peer_id: int, packet: PackedByteArray) -> void:
+	if packet.size() < 2:
+		return
+	var msg: Variant = bytes_to_var(packet)
+	if typeof(msg) != TYPE_ARRAY:
+		return
+	var arr: Array = msg
+	if arr.is_empty():
+		return
+	match int(arr[0]):
+		MSG_STATE:
+			if arr.size() >= 9:
+				_peer_state(arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7], arr[8])
+		MSG_FIRE:
+			if arr.size() >= 4:
+				_peer_fire(arr[1], arr[2], arr[3])
+		MSG_KILL:
+			if arr.size() >= 3:
+				_peer_kill(arr[1], arr[2])
+		MSG_HEALTH:
+			if arr.size() >= 3:
+				_peer_health(arr[1], arr[2])
 
 
 ## 问玩家节点要当前的外观朝向。外观策略属于 player.gd，这里不自己拼 rotation.y。
@@ -244,7 +313,6 @@ func _visual_alive() -> bool:
 
 
 ## 收到的每个包都会被标成来自 1 号，所以发送者身份只能自己写在参数里。
-@rpc("any_peer", "call_remote")
 func _peer_state(
 	id: int, pos: Vector3, yaw: float, pitch: float, crouch: float,
 	kills: int, deaths: int, alive: bool
@@ -644,6 +712,8 @@ func _hud_info() -> Dictionary:
 	var hud := _hud_node()
 	if hud == null:
 		return {}
+	# 向量拆成两个数再进 JSON：快照是用 JSON.stringify 写给页面的。
+	var cross_offset: Vector2 = hud.call("crosshair_center_offset")
 	return {
 		"scoreboard": str(hud.call("scoreboard_text")),
 		"banner": str(hud.call("banner_text")),
@@ -654,6 +724,8 @@ func _hud_info() -> Dictionary:
 		"hint": str(hud.call("hint_text")),
 		"crosshairGap": float(hud.call("crosshair_gap")),
 		"crosshairCenter": float(hud.call("crosshair_center_size")),
+		"crosshairOffsetX": snappedf(cross_offset.x, 0.01),
+		"crosshairOffsetY": snappedf(cross_offset.y, 0.01),
 	}
 
 
@@ -728,9 +800,7 @@ func _cam_offset() -> float:
 ## 告诉所有人“我开了一枪”。origin 是枪口，direction 是子弹实际飞行的方向
 ## （已含散布，所以不是“朝向准星”而是“这一发真的往哪飞”）。
 func broadcast_fire(origin: Vector3, direction: Vector3) -> void:
-	if my_id <= 0:
-		return
-	rpc("_peer_fire", my_id, origin, direction)
+	_send(MSG_FIRE, [my_id, origin, direction])
 
 
 ## 告诉所有人“我倒下了，凶手是他”。killer_id 为 0 表示没有明确凶手。
@@ -738,22 +808,17 @@ func broadcast_fire(origin: Vector3, direction: Vector3) -> void:
 ## 击杀由**被打者**广播：判定权本来就在他手上（见 player.gd 的 receive_shot），
 ## 中继对所有人是同一份转发，所以两端按同一顺序得到同一条事件，比分天然一致。
 func broadcast_kill(victim_id: int, killer_id: int) -> void:
-	if my_id <= 0:
-		return
-	rpc("_peer_kill", victim_id, killer_id)
+	_send(MSG_KILL, [victim_id, killer_id])
 
 
 ## 血量变化时告知所有人（包括自己被打倒后重生回满血）。
 func broadcast_health(hp: int) -> void:
-	if my_id <= 0:
-		return
-	rpc("_peer_health", my_id, hp)
+	_send(MSG_HEALTH, [my_id, hp])
 
 
 ## 收到别人的枪声。做两件事：把这条弹道画出来，再让本地玩家判定自己有没有被打到。
 ##
 ## 判定交给本地玩家而不是射击方，理由见 player.gd 的 `receive_shot`。
-@rpc("any_peer", "call_remote")
 func _peer_fire(shooter_id: int, origin: Vector3, direction: Vector3) -> void:
 	if shooter_id == my_id or shooter_id <= 1:
 		return
@@ -784,7 +849,6 @@ func _peer_fire(shooter_id: int, origin: Vector3, direction: Vector3) -> void:
 
 
 ## 收到击杀事件（由被打者广播，见 broadcast_kill）。
-@rpc("any_peer", "call_remote")
 func _peer_kill(victim_id: int, killer_id: int) -> void:
 	if victim_id == my_id or victim_id <= 1:
 		return
@@ -796,7 +860,6 @@ func _peer_kill(victim_id: int, killer_id: int) -> void:
 
 
 ## 收到血量变化。打中提示就是从这里来的：看到别人的血真的掉了才算命中。
-@rpc("any_peer", "call_remote")
 func _peer_health(id: int, hp: int) -> void:
 	if id == my_id or id <= 1:
 		return

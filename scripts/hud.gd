@@ -26,10 +26,13 @@ const FLASH_TIME := 0.35
 
 ## 准星：中心一个点，四周四根短线，间距跟着当前散布张开。
 ##
-## 【为什么中心这么小】它曾经是 6×6 的实心方块（写在 main.tscn 里），实测挡视野：
-## 屏幕正中恰好是看对手的位置，方块一大就把目标盖住。缩到 3×3 的小点，
-## 既能指出中心，又不遮住东西。四根短线只是**散布的指示器**，不参与瞄准。
-const CROSS_CENTER := 3.0
+## 【为什么中心这么小，而且要 1 像素】它曾经是 6×6 的实心方块（写在 main.tscn 里），实测挡视野：
+## 屏幕正中恰好是看对手的位置，方块一大就把目标盖住。缩到 3×3 之后仍然被点名“位置偏了”：
+## 3 像素的方块配上 ±1.5 的偏移，边缘就落在**半像素**上，光栅化会把它摊成 3～4 个
+## 带半覆盖的像素，看起来就是偏了一点。现在是 1 像素、并且由 `_align_crosshair()`
+## 把左边缘对齐到整像素，正好压住一个像素。
+## 四根短线只是**散布的指示器**，不参与矄准。
+const CROSS_CENTER := 1.0
 const CROSS_BASE_GAP := 4.0
 const CROSS_GAP_PER_DEG := 3.2
 const CROSS_LEN := 6.0
@@ -82,6 +85,9 @@ func _ready() -> void:
 	_build_flash()
 	_build_crosshair()
 	_build_hint()
+	# 视口尺寸变了要重新对齐准星：点击画面会进全屏，实测视口从 1258x566 变成 800x544，
+	# 而像素对齐跟宽度/高度的奇偶有关。
+	get_viewport().size_changed.connect(_align_crosshair)
 	# 初始值先填上：player.gd 在 _ready 里推血量时，HUD 可能还没进 group，
 	# 靠那次推送会留下一个空白的血量文字。
 	set_health(100, 100)
@@ -251,6 +257,23 @@ func crosshair_gap() -> float:
 ## 所以报出来让自动化检查守着，而不是只靠人工看截图。
 func crosshair_center_size() -> float:
 	return CROSS_CENTER
+
+
+## 中心点相对“视口正中”的偏移（像素，带符号）。
+##
+## 用户报过“准星位置偏移”：那不是尺寸问题，而是 3 像素方块配上 ±1.5 的偏移落在半像素上，
+## 光栅化把它摊成一个看起来偏了的斑。所以这里把“到底居中没居中”做成可断言的数值。
+## 判据是 |偏移| ≤ 0.5：偶数宽度下它必然差半个像素（正中落在两个像素的边界上），
+## 那是 1 像素的点无论怎么摆都消不掉的。
+func crosshair_center_offset() -> Vector2:
+	if _cross_center == null:
+		return Vector2.ZERO
+	var view := get_viewport().get_visible_rect().size
+	# 直接从锚点与偏移算，不读 position/size：那两者要等一次布局才会更新，量到的会是旧值。
+	var left := view.x * _cross_center.anchor_left + _cross_center.offset_left
+	var top := view.y * _cross_center.anchor_top + _cross_center.offset_top
+	var half := CROSS_CENTER * 0.5
+	return (Vector2(left + half, top + half) - view * 0.5).snapped(Vector2(0.01, 0.01))
 
 ## 比分板的文字（按行用 " | " 连接）。检查“界面真的显示了比分”要靠它，
 ## 只读 Match 里的数字不够——数字对、界面没画出来也是一样的。
@@ -441,10 +464,7 @@ func _build_flash() -> void:
 ## 准星：中心一个点 + 四根会动的短线。
 func _build_crosshair() -> void:
 	_cross_center = _center_rect("CrossCenter")
-	_cross_center.offset_left = -CROSS_CENTER * 0.5
-	_cross_center.offset_top = -CROSS_CENTER * 0.5
-	_cross_center.offset_right = CROSS_CENTER * 0.5
-	_cross_center.offset_bottom = CROSS_CENTER * 0.5
+	_align_crosshair()
 
 	for i in 4:
 		var rect := _center_rect("Cross%d" % i)
@@ -457,6 +477,22 @@ func _build_crosshair() -> void:
 			rect.offset_top = -CROSS_THICK * 0.5
 			rect.offset_bottom = CROSS_THICK * 0.5
 	set_spread(0.0)
+
+
+## 把中心点摆到屏幕正中，并且**对齐到整像素**。
+##
+## 屏幕正中在**偶数**宽度下落在两个像素的边界上，所以 1 像素的点只能选其中一侧
+## （差半个像素，肉眼不可见）；想完全对称就得用 2 像素的点，而那会重新变糊。
+func _align_crosshair() -> void:
+	if _cross_center == null:
+		return
+	var view := get_viewport().get_visible_rect().size
+	var left := floorf(view.x * 0.5 - CROSS_CENTER * 0.5)
+	var top := floorf(view.y * 0.5 - CROSS_CENTER * 0.5)
+	_cross_center.offset_left = left - view.x * 0.5
+	_cross_center.offset_top = top - view.y * 0.5
+	_cross_center.offset_right = _cross_center.offset_left + CROSS_CENTER
+	_cross_center.offset_bottom = _cross_center.offset_top + CROSS_CENTER
 
 
 ## 建一个锚在屏幕正中的矩形。准星的五个部件都是这种，只有偏移量不同。
