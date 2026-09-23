@@ -686,6 +686,10 @@ func _peer_fire(shooter_id: int, origin: Vector3, direction: Vector3) -> void:
 	if not hit.is_empty():
 		end = hit["position"]
 	Fx.tracer(origin, end, color)
+	# 对方的枪也要亮膛口火光（顺带后退一点）：之前只有曳光，看不到“他从哪开火”。
+	var avatar = _avatars.get(shooter_id)
+	if avatar != null and avatar.gun != null:
+		avatar.gun.flash()
 	# 别人的枪声按世界位置播放：能听出他在左边还是右边，是这个视角下唯一的空间线索。
 	Sfx.play_shot(origin)
 	if not hit.is_empty():

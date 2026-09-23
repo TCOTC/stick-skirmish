@@ -71,6 +71,13 @@ extends CharacterBody3D
 ## 站立↔下蹲的过渡时长（秒）。
 @export var crouch_time: float = 0.18
 
+## 开一发时的镜头抖动幅度（米）。
+@export var fire_shake: float = 0.006
+## 挨打时的镜头抖动幅度（米）。被打比开枪更“震”，这样挨枪能立刻感觉到。
+@export var hit_shake: float = 0.024
+## 抖动衰减速度（米/秒）。
+@export var shake_recover: float = 0.17
+
 ## 刚接管鼠标后这段时间内不开火：那一次点击是用来锁定指针的，不该顺手打出一发。
 const FIRE_BLOCK_AFTER_CAPTURE := 0.25
 
@@ -90,6 +97,9 @@ const StickFigureScript := preload("res://scripts/stick_figure.gd")
 var _pitch: float = START_PITCH
 # 下蹲程度：0 = 站立，1 = 完全蹲下。
 var _crouch := 0.0
+## 镜头抖动幅度（米）。开火与挨打时抬起来，随后衰减到 0。
+## 数值刻意很小：它的作用是“这一下有份量”，而不是把视野摇得看不清对手。
+var _shake := 0.0
 var _gravity: float = 24.0
 # 是否处于"正在操作"状态。判定标准就是鼠标是否被锁定：
 # 光标还露在外面（还没点进游戏，或者刚按了 Esc）就不该能操作。
@@ -185,6 +195,7 @@ func _physics_process(delta: float) -> void:
 	_fire_block = maxf(0.0, _fire_block - delta)
 	# 散布回落。与生死无关，所以放在存活判断之前。
 	_spread = maxf(spread_min_deg, _spread - spread_recover_per_sec * delta)
+	_shake = maxf(0.0, _shake - shake_recover * delta)
 
 	# 这两件事与生死无关（倒地时枪口姿态也要正确收尾），所以放在存活判断之前。
 	_update_stance(active, delta)
@@ -249,6 +260,14 @@ func aim_pitch() -> float:
 
 func _apply_aim() -> void:
 	_arm.rotation.x = aim_pitch()
+	# 抖动写在相机的 h/v_offset 上，**不动** SpringArm 的位置与旋转：
+	# 位置 .y 是下蹲用的、rotation 是俯仰用的，混在一起会让那些数值不再可断言。
+	if _shake > 0.0002:
+		_camera.h_offset = randf_range(-_shake, _shake)
+		_camera.v_offset = randf_range(-_shake, _shake)
+	elif _camera.h_offset != 0.0 or _camera.v_offset != 0.0:
+		_camera.h_offset = 0.0
+		_camera.v_offset = 0.0
 
 
 ## 下蹲程度（0 站、1 蹲）。供自动化检查与网络同步读取。
@@ -374,6 +393,7 @@ func _try_fire() -> void:
 
 	figure.gun.flash()
 	Sfx.play_local_shot()
+	_shake = maxf(_shake, fire_shake)
 	Fx.tracer(muzzle, end, figure.limb_color())
 	if not shot_hit.is_empty():
 		Fx.impact(shot_hit["position"], shot_hit["normal"], figure.limb_color())
@@ -440,6 +460,7 @@ func take_damage(amount: int, killer_id := 0) -> void:
 	if hud != null:
 		hud.call("damage_flash", 0.32)
 	Sfx.play_hurt()
+	_shake = maxf(_shake, hit_shake)
 	_update_hud()
 	if Net.connected:
 		Net.broadcast_health(health)

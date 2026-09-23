@@ -16,9 +16,18 @@ const BARREL_LEN := 0.34
 const BARREL_TIP := 0.44      # 枪口到握把原点的距离
 const FLASH_TIME := 0.07      # 膛口火光时长，与曳光差不多，一起形成“一发的印象”
 
+## 开火那一瞬间枪身往后退的量（米）。枪沿本地 -Y 指向前方，所以 +Y 就是“往后退”。
+## 它只是视觉上的跳动：子弹方向与枪口位置都不取这个偏移（否则曳光会跟着抽一下）。
+const KICK := 0.03
+## 回位速度（米/秒）。
+const KICK_RECOVER := 0.42
+
 var _muzzle: Node3D = null
 var _flash: MeshInstance3D = null
 var _flash_left := 0.0
+# 握把相对手的位置。kick 是在它之上的偏移，回位就是回到它。
+var _rest := Vector3.ZERO
+var _kick := 0.0
 
 
 func _ready() -> void:
@@ -30,6 +39,9 @@ func build(accent: Color) -> void:
 	for child in get_children():
 		remove_child(child)
 		child.queue_free()
+	# 调用方已经把这把枪摆到手上了（见 stick_figure._attach_gun），记下来当回位的目标。
+	_kick = 0.0
+	_rest = position
 
 	var metal := _mat(METAL)
 	var tint := _mat(accent)
@@ -82,15 +94,22 @@ func _process(delta: float) -> void:
 	if _flash_left <= 0.0:
 		if _flash != null:
 			_flash.visible = false
+	# 后退量线性回位
+	if _kick > 0.0:
+		_kick = maxf(0.0, _kick - KICK_RECOVER * delta)
+		position = _rest + Vector3(0.0, _kick, 0.0)
+	if _flash_left <= 0.0 and _kick <= 0.0:
 		set_process(false)
 
 
-## 亮一下膛口火光。连续开火时每发都会重新点亮。
+## 亮一下膛口火光，并让枪身后退一点。连续开火时每发都会重新点亮。
 func flash() -> void:
 	if _flash == null:
 		return
 	_flash.visible = true
 	_flash_left = FLASH_TIME
+	_kick = KICK
+	position = _rest + Vector3(0.0, _kick, 0.0)
 	set_process(true)
 
 
