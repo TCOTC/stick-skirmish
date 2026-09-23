@@ -183,7 +183,8 @@ func _send_state(delta: float) -> void:
 	# 广播：中继不做定向，rpc() 默认就是发给所有对端。
 	# 发的是**视觉朝向**（火柴人面朝哪边），不是 player.rotation.y（镜头朝向）：
 	# 本地火柴人跟着移动方向转，发镜头朝向的话双方看到的脸就不一致了。
-	rpc("_peer_state", my_id, _player.global_position, _visual_yaw(), _visual_pitch())
+	rpc("_peer_state", my_id, _player.global_position, _visual_yaw(), _visual_pitch(),
+		_visual_crouch())
 
 
 ## 问玩家节点要当前的外观朝向。外观策略属于 player.gd，这里不自己拼 rotation.y。
@@ -196,15 +197,23 @@ func _visual_yaw() -> float:
 
 
 ## 镜头俯仰。替身拿它摆枪口角度，不然对方的枪会一直平指。
+## 取的是**含后坐力**的生效俯仰（player.aim_pitch），否则开枪时对方的枪不会跟着抬。
 func _visual_pitch() -> float:
 	if _player != null and _player.has_method("aim_pitch"):
 		return float(_player.call("aim_pitch"))
 	return 0.0
 
 
+## 下蹲程度。替身据此摆蹲姿。
+func _visual_crouch() -> float:
+	if _player != null and _player.has_method("crouch_amount"):
+		return float(_player.call("crouch_amount"))
+	return 0.0
+
+
 ## 收到的每个包都会被标成来自 1 号，所以发送者身份只能自己写在参数里。
 @rpc("any_peer", "call_remote")
-func _peer_state(id: int, pos: Vector3, yaw: float, pitch: float) -> void:
+func _peer_state(id: int, pos: Vector3, yaw: float, pitch: float, crouch: float) -> void:
 	if id == my_id or id <= 1:
 		return
 
@@ -223,6 +232,7 @@ func _peer_state(id: int, pos: Vector3, yaw: float, pitch: float) -> void:
 	entry["pos"] = pos
 	entry["yaw"] = yaw
 	entry["pitch"] = pitch
+	entry["crouch"] = crouch
 	entry["at"] = now
 	entry["speed"] = speed
 	entry["grounded"] = pos.y < GROUND_Y_MAX
@@ -363,7 +373,8 @@ func _smooth_avatars(delta: float) -> void:
 		avatar.rotation.y = lerp_angle(avatar.rotation.y, float(entry["yaw"]), weight)
 		avatar.aim_pitch = float(entry.get("pitch", 0.0))
 		avatar.animate(
-			float(entry.get("speed", 0.0)), bool(entry.get("grounded", true)), delta
+			float(entry.get("speed", 0.0)), bool(entry.get("grounded", true)), delta,
+			float(entry.get("crouch", 0.0))
 		)
 
 
@@ -436,6 +447,34 @@ func _publish() -> void:
 	if _player != null and "shots_fired" in _player:
 		shots = int(_player.get("shots_fired"))
 
+	# 后坐力与下蹲的实时值，供自动化检查验证“开火抬枪、松开回落、蹲下减后坐”。
+	var recoil := 0.0
+	var crouch := 0.0
+	var pitch_deg := 0.0
+	var cam_y := 0.0
+	# 后坐力与下蹲的配置值一并报出去：自动化检查据此断言，
+	# 这样改了配置之后测试会跟着变，而不是在测试里另写一份常量（两个真相来源）。
+	var recoil_per_shot_deg := 0.0
+	var recoil_max_deg := 0.0
+	var crouch_recoil_scale := 1.0
+	if _player != null:
+		if _player.has_method("recoil_deg"):
+			recoil = float(_player.call("recoil_deg"))
+		if _player.has_method("crouch_amount"):
+			crouch = float(_player.call("crouch_amount"))
+		if _player.has_method("aim_pitch"):
+			pitch_deg = rad_to_deg(float(_player.call("aim_pitch")))
+		var arm := _player.get_node_or_null("SpringArm")
+		if arm != null:
+			cam_y = arm.position.y
+		recoil_per_shot_deg = float(_player.get("recoil_per_shot_deg"))
+		recoil_max_deg = float(_player.get("recoil_max_deg"))
+		crouch_recoil_scale = float(_player.get("crouch_recoil_scale"))
+		recoil = snappedf(recoil, 0.01)
+		crouch = snappedf(crouch, 0.01)
+		pitch_deg = snappedf(pitch_deg, 0.01)
+		cam_y = snappedf(cam_y, 0.01)
+
 	# 替身的装饰件（命中框、头顶血条）是否还在。
 	# 它们挂在替身节点下，而外观重建曾经会把子节点全删掉，把这两个一起吞了——
 	# 症状只是“画面上看不到”，所以宁可断言也不要靠看。
@@ -465,6 +504,13 @@ func _publish() -> void:
 		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
 		"health": own_health,
 		"shots": shots,
+		"recoilDeg": recoil,
+		"crouch": crouch,
+		"pitchDeg": pitch_deg,
+		"camY": cam_y,
+		"recoilPerShotDeg": recoil_per_shot_deg,
+		"recoilMaxDeg": recoil_max_deg,
+		"crouchRecoilScale": crouch_recoil_scale,
 		"fx": _count_fx(),
 		"headScreenY": head_screen_y,
 	}

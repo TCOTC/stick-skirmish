@@ -54,6 +54,17 @@ func _count_bones(fig: Node) -> int:
 	return skeleton.get_bone_count() if skeleton != null else 0
 
 
+## 某根骨头默认姿态下的世界高度。读 pose 而不是 rest，因为附件跟的是 pose。
+func _bone_y(fig: Node, bone_name: String) -> float:
+	var skeleton := fig.get_node_or_null("Skeleton3D") as Skeleton3D
+	if skeleton == null:
+		return 0.0
+	var idx := skeleton.find_bone(bone_name)
+	if idx < 0:
+		return 0.0
+	return skeleton.get_bone_global_pose(idx).origin.y
+
+
 ## 检查每根骨头上的 BoneAttachment3D 是否真的绑上了骨头、并且挂着该有的网格。
 ##
 ## 这一项是补上的：曾经只检查了骨骼数量和网格总数，结果整个角色只剩一个躯干——
@@ -474,6 +485,37 @@ func _run_checks() -> void:
 		"换样式后骨骼依然存在"
 	)
 	fig.apply_style(0)
+
+	# --- 下蹲姿态 ---
+	# 站直与蹲下各跑一会儿，比较骨头高度与膝盖角度：一定要“看得见地矮下去”。
+	for i in 30:
+		fig.animate(0.0, true, 1.0 / 60.0, 0.0)
+	var stand_hips := _bone_y(fig, "hips")
+	var stand_knee: float = fig.bone_angle("lower_leg_l")
+
+	for i in 30:
+		fig.animate(0.0, true, 1.0 / 60.0, 1.0)
+	var crouch_hips := _bone_y(fig, "hips")
+	var crouch_knee: float = fig.bone_angle("lower_leg_l")
+
+	_check(
+		crouch_hips < stand_hips - 0.2,
+		"下蹲时骨盆明显降低",
+		"站立 %.2f → 蹲下 %.2f 米" % [stand_hips, crouch_hips]
+	)
+	_check(
+		crouch_knee < stand_knee - 0.4,
+		"下蹲时膝盖更弯",
+		"站立 %.2f → 蹲下 %.2f 弧度" % [stand_knee, crouch_knee]
+	)
+	# 蹲完要能站起来，不然判定通过但姿态会卡住
+	for i in 60:
+		fig.animate(0.0, true, 1.0 / 60.0, 0.0)
+	_check(
+		absf(_bone_y(fig, "hips") - stand_hips) < 0.02,
+		"站起来后骨盆回到原高度",
+		"%.2f 米" % _bone_y(fig, "hips")
+	)
 
 
 ## 替身头顶的血条：这个类单独验一遍，因为它在联机侧是动态创建的，

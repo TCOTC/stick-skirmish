@@ -112,6 +112,13 @@ const CROSS_BARS: Array = [
 	["neck", Vector3.ZERO, SHOULDER_X * 2.0 + 0.06, 0.95],     # 肩：连两条手臂
 ]
 
+# 下蹲姿态：[骨盆下降幅度, 膝盖额外弯曲, 大腿额外前摆, 躯干额外前倾]
+# 骨盆下降只是“跷跷板”式的视觉下蹲，**不改碰撞胶囊**，所以现在钻不进矮掩体。
+const CROUCH_DROP := 0.32
+const CROUCH_KNEE := 0.85
+const CROUCH_LEG := 0.30
+const CROUCH_LEAN := 0.16
+
 # 关节球：[骨骼, 相对位置, 半径系数]。填住两段圆柱转动时裂开的 V 形缝。
 const JOINTS: Array = [
 	["upper_arm_l", Vector3.ZERO, 1.35],
@@ -421,7 +428,8 @@ func _add_chest_band(radius: float) -> void:
 
 
 ## 每帧驱动步态。本机玩家传物理速度；替身传由收到的位置差分算出的速度。
-func animate(move_speed: float, grounded: bool, delta: float) -> void:
+## crouch 是下蹲程度（0 站、1 蹲），替身由同步过来的值给出。
+func animate(move_speed: float, grounded: bool, delta: float, crouch := 0.0) -> void:
 	if _skeleton == null:
 		return
 
@@ -463,6 +471,16 @@ func animate(move_speed: float, grounded: bool, delta: float) -> void:
 	elbow = lerpf(elbow, AIR_ELBOW, _air)
 	bob = lerpf(bob, 0.0, _air)
 	lean = lerpf(lean, -AIR_LEAN, _air)
+
+	# 下蹲：降低胟部、膝盖更弯、大腿略微前摆、躯干略前倾。
+	# 膝盖只能向后弯，所以这里在原有负值基础上再减。
+	if crouch > 0.001:
+		bob -= CROUCH_DROP * crouch
+		knee_l -= CROUCH_KNEE * crouch
+		knee_r -= CROUCH_KNEE * crouch
+		leg_l += CROUCH_LEG * crouch
+		leg_r += CROUCH_LEG * crouch
+		lean -= CROUCH_LEAN * crouch
 
 	_set_rot("upper_leg_l", leg_l)
 	_set_rot("upper_leg_r", leg_r)

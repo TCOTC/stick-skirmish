@@ -294,22 +294,31 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "stick-netprobe-"));
 // 顶层 await 会暂停模块求值，声明写在下方的 const 会一直处于暂时性死区，
 // 主流程里调用就会报 "Cannot access 'VK' before initialization"。
 
-// Godot 网页版按 event.code 匹配物理键位，所以要一并给出 code 与虚拟键码。
-const VK = { KeyW: 87, KeyA: 65, KeyS: 83, KeyD: 68 };
+// Godot 网页版按 event.code 匹配物理键位，所以要一并给出 code、虚拟键码与 key 名。
+const KEYS = {
+  KeyW: { vk: 87, key: "w" },
+  KeyA: { vk: 65, key: "a" },
+  KeyS: { vk: 83, key: "s" },
+  KeyD: { vk: 68, key: "d" },
+  Space: { vk: 32, key: " " },
+  ShiftLeft: { vk: 16, key: "Shift" },
+};
 
 async function keyDown(cdp, code) {
-  const vk = VK[code];
+  const k = KEYS[code];
+  if (!k) throw new Error(`未登记的按键: ${code}`);
   await cdp.send("Input.dispatchKeyEvent", {
-    type: "rawKeyDown", windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
-    code, key: code.slice(3).toLowerCase(),
+    type: "rawKeyDown", windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk,
+    code, key: k.key,
   });
 }
 
 async function keyUp(cdp, code) {
-  const vk = VK[code];
+  const k = KEYS[code];
+  if (!k) throw new Error(`未登记的按键: ${code}`);
   await cdp.send("Input.dispatchKeyEvent", {
-    type: "keyUp", windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
-    code, key: code.slice(3).toLowerCase(),
+    type: "keyUp", windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk,
+    code, key: k.key,
   });
 }
 
@@ -357,6 +366,43 @@ async function mouseDelta(cdp, px) {
 function decorOk(state) {
   const entries = Object.entries(state.avatarDecor ?? {});
   return entries.length > 0 && entries.every(([, d]) => d.hitBox && d.barOk);
+}
+
+/**
+ * 按住左键打一段，返回这段里的俯仰抬升情况。
+ *
+ * 后坐力是“真抬准星”，所以开火期间 `pitchDeg` 会上升、松开后回落。
+ * 拿它做断言比看截图可靠：抬了多少度是确定的数值。
+ */
+async function fireBurst(cdp, samples, fxSink) {
+  const before = await readStat(cdp);
+  const pitchBefore = before?.pitchDeg ?? 0;
+  let peak = pitchBefore;
+  let peakRecoil = 0;
+
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+  for (let i = 0; i < samples; i++) {
+    const s = await readStat(cdp);
+    if (s) {
+      if (fxSink) fxSink.push(s.fx);
+      peak = Math.max(peak, s.pitchDeg ?? 0);
+      peakRecoil = Math.max(peakRecoil, s.recoilDeg ?? 0);
+    }
+    await sleep(60);
+  }
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+
+  return {
+    pitchBefore,
+    pitchClimb: peak - pitchBefore,
+    peakRecoil,
+    shotsBefore: before?.shots ?? 0,
+    shotsAfter: (await readStat(cdp))?.shots ?? 0,
+  };
 }
 
 /** 轮询直到条件满足或超时。 */
@@ -696,23 +742,39 @@ async function checkShoot() {
   const shotsBefore = (await readStat(a.cdp))?.shots ?? 0;
   const fireStart = Date.now();
   const fxSeen = [];
-  await a.cdp.send("Input.dispatchMouseEvent", {
-    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
-  });
-  for (let i = 0; i < 12; i++) {
-    const s = await readStat(a.cdp);
-    if (s) fxSeen.push(s.fx);
-    await sleep(60);
-  }
-  await a.cdp.send("Input.dispatchMouseEvent", {
-    type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
-  });
+  const standBurst = await fireBurst(a.cdp, 12, fxSeen);
   const fireMs = Date.now() - fireStart;
 
   const afterFire = await readStat(a.cdp);
   const shotsDelta = (afterFire?.shots ?? 0) - shotsBefore;
   const fxMax = fxSeen.length ? Math.max(...fxSeen) : 0;
   const ratePerSec = shotsDelta / Math.max(0.001, fireMs / 1000);
+
+  // 后坐力应当回落：等一会儿再看，俯仰要回到开火前的水准（鼠标没动过）。
+  const recoilBack = await waitFor(async () => {
+    const s = await readStat(a.cdp);
+    return s && Math.abs(s.pitchDeg - standBurst.pitchBefore) < 0.6 ? s : null;
+  }, 6000, 250);
+  const recovered = recoilBack !== null;
+  const recoilLeft = recoilBack ? Math.abs(recoilBack.pitchDeg - standBurst.pitchBefore) : 999;
+
+  // 下蹲：按住 Shift 应当下蹲（相机下降）、并且后坐力明显变小。
+  const crouchBefore = await readStat(a.cdp);
+  const recoilPerShot = crouchBefore?.recoilPerShotDeg ?? 0;
+  const recoilMax = crouchBefore?.recoilMaxDeg ?? 0;
+  await keyDown(a.cdp, "ShiftLeft");
+  const crouched = await waitFor(async () => {
+    const s = await readStat(a.cdp);
+    return s && s.crouch > 0.95 ? s : null;
+  }, 4000, 200);
+
+  const crouchBurst = await fireBurst(a.cdp, 8, []);
+  await keyUp(a.cdp, "ShiftLeft");
+  await waitFor(async () => {
+    const s = await readStat(a.cdp);
+    return s && s.crouch < 0.05 ? s : null;
+  }, 4000, 200);
+  const standAfter = await readStat(a.cdp);
 
   // 等 beta 身上的扣血（后台标签页会被节流，给足时间）
   const hurt = await waitFor(async () => {
@@ -788,6 +850,23 @@ async function checkShoot() {
       `按住 ${fireMs} ms 打出 ${shotsDelta} 发，合 ${ratePerSec.toFixed(1)} 发/秒（配置 9）`],
     ["开火产生了特效（曳光/弹着点）", fxMax > 0, `同时存在的特效最多 ${fxMax} 个`],
     ["特效会自己清掉（不堆积）", fxAfter === 0, `1.2 秒后剩 ${fxAfter} 个`],
+    ["开火时准星被抬起（后坐力）", standBurst.pitchClimb > 1.0,
+      `俯仰 ${standBurst.pitchBefore.toFixed(1)}° → 峰值 ${(standBurst.pitchBefore + standBurst.pitchClimb).toFixed(1)}°，`
+      + `抬升 ${standBurst.pitchClimb.toFixed(1)}°（每发 ${recoilPerShot}°、上限 ${recoilMax}°）`],
+    ["后坐力会自行回落", recovered,
+      `松开后残余 ${recoilLeft.toFixed(2)}°`],
+    ["后坐力不超过上限", standBurst.peakRecoil <= recoilMax + 0.3,
+      `峰值 ${standBurst.peakRecoil.toFixed(2)}°（上限 ${recoilMax}°，配置值）`],
+    ["按住 Shift 会下蹲", crouched !== null,
+      `下蹲程度 ${(crouched?.crouch ?? 0).toFixed(2)}（0 站、1 蹲）`],
+    ["下蹲时相机降低", crouched !== null && crouched.camY < crouchBefore.camY - 0.2,
+      `相机 ${crouchBefore.camY.toFixed(2)} → ${(crouched?.camY ?? 0).toFixed(2)} 米`],
+    ["下蹲时准星仍不被自己挡住", crouched !== null && crouched.headScreenY >= 0.55,
+      `头顶屏幕纵向 ${(crouched?.headScreenY ?? -1).toFixed(2)}（准星 0.50，应当更大）`],
+    ["下蹲后后坐力变小", crouchBurst.pitchClimb < standBurst.pitchClimb * 0.7,
+      `站立抬 ${standBurst.pitchClimb.toFixed(1)}° / 下蹲抬 ${crouchBurst.pitchClimb.toFixed(1)}°`],
+    ["松开 Shift 后能站起来", standAfter !== null && standAfter.crouch < 0.05,
+      `下蹲程度 ${(standAfter?.crouch ?? -1).toFixed(2)}，相机回到 ${(standAfter?.camY ?? 0).toFixed(2)} 米`],
     ["被打的人扣了血", betaHealth < 100, `beta 血量 ${betaHealth}`],
     ["血量归零后重生回满血", betaHealth > 0 || revived !== null,
       betaHealth > 0 ? `未打死（剩 ${betaHealth}）` : `重生后 ${revived?.health ?? "未恢复"}`],

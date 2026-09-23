@@ -42,9 +42,23 @@ const CLIP = opt("clip", "340,60,600,640").split(",").map(Number);
 // 写死坐标会捕空，所以按住键拍姿态时用这个。
 const CENTER = opt("center", "");
 const ZOOM = Number(opt("zoom", 2));
-// 可选：截图前按住某些键，用来拍走路之类的姿态。可多个，用逗号分隔（如 a,s）。
+// 可选：截图前按住某些键，用来拍走路之类的姿态。可多个，用逗号分隔（如 a,s 或 w,shift）。
+// 名字用字母或 shift / space。Godot 网页版按 event.code 匹配物理键位。
 const HOLD_KEY = opt("key", "");
 const HOLD_MS = Number(opt("hold", 1200));
+
+const KEYS = {
+  shift: { code: "ShiftLeft", vk: 16, key: "Shift" },
+  space: { code: "Space", vk: 32, key: " " },
+};
+
+function keyInfo(name) {
+  if (KEYS[name]) return KEYS[name];
+  if (name.length !== 1 || !/[a-z]/.test(name)) {
+    throw new Error(`未登记的按键: ${name}（可用字母、shift、space）`);
+  }
+  return { code: `Key${name.toUpperCase()}`, vk: 65 + name.charCodeAt(0) - 97, key: name };
+}
 // 可选：附加查询串，例如 cam=front（把相机转到角色正面核对面部）
 const QUERY = opt("query", "");
 
@@ -208,11 +222,11 @@ try {
     }
     usedPointerLock = true;   // 收尾时要用到
     const keys = HOLD_KEY.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
-    const vkOf = (k) => 65 + "abcdefghijklmnopqrstuvwxyz".indexOf(k);
-    for (const k of keys) {
+    for (const name of keys) {
+      const info = keyInfo(name);
       await cdp.send("Input.dispatchKeyEvent", {
-        type: "rawKeyDown", windowsVirtualKeyCode: vkOf(k), nativeVirtualKeyCode: vkOf(k),
-        code: `Key${k.toUpperCase()}`, key: k,
+        type: "rawKeyDown", windowsVirtualKeyCode: info.vk, nativeVirtualKeyCode: info.vk,
+        code: info.code, key: info.key,
       });
     }
     await sleep(HOLD_MS);
@@ -248,11 +262,11 @@ try {
 
   if (HOLD_KEY) {
     const keys = HOLD_KEY.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
-    const vkOf = (k) => 65 + "abcdefghijklmnopqrstuvwxyz".indexOf(k);
-    for (const k of keys.reverse()) {
+    for (const name of keys.reverse()) {
+      const info = keyInfo(name);
       await cdp.send("Input.dispatchKeyEvent", {
-        type: "keyUp", windowsVirtualKeyCode: vkOf(k), nativeVirtualKeyCode: vkOf(k),
-        code: `Key${k.toUpperCase()}`, key: k,
+        type: "keyUp", windowsVirtualKeyCode: info.vk, nativeVirtualKeyCode: info.vk,
+        code: info.code, key: info.key,
       });
     }
   }
