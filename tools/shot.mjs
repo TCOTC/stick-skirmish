@@ -42,9 +42,11 @@ const CLIP = opt("clip", "340,60,600,640").split(",").map(Number);
 // 写死坐标会捕空，所以按住键拍姿态时用这个。
 const CENTER = opt("center", "");
 const ZOOM = Number(opt("zoom", 2));
-// 可选：截图前按住某些键，用来拍走路之类的姿态
+// 可选：截图前按住某些键，用来拍走路之类的姿态。可多个，用逗号分隔（如 a,s）。
 const HOLD_KEY = opt("key", "");
 const HOLD_MS = Number(opt("hold", 1200));
+// 可选：附加查询串，例如 cam=front（把相机转到角色正面核对面部）
+const QUERY = opt("query", "");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -175,7 +177,7 @@ try {
   await cdp.send("Runtime.enable");
   await cdp.send("Page.enable");
 
-  const url = `${BASE}/index.html`;
+  const url = QUERY ? `${BASE}/index.html?${QUERY}` : `${BASE}/index.html`;
   console.log(`  截图目标: ${url}`);
   await cdp.send("Page.navigate", { url });
 
@@ -205,13 +207,14 @@ try {
       await sleep(200);
     }
     usedPointerLock = true;   // 收尾时要用到
-    const code = HOLD_KEY.length === 1 ? `Key${HOLD_KEY.toUpperCase()}` : HOLD_KEY;
-    const vk = code === "KeyW" ? 87 : code === "KeyA" ? 65 : code === "KeyS" ? 83 : 68;
-    holdKey = { code, vk, key: HOLD_KEY.toLowerCase() };
-    await cdp.send("Input.dispatchKeyEvent", {
-      type: "rawKeyDown", windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
-      code: holdKey.code, key: holdKey.key,
-    });
+    const keys = HOLD_KEY.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
+    const vkOf = (k) => 65 + "abcdefghijklmnopqrstuvwxyz".indexOf(k);
+    for (const k of keys) {
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "rawKeyDown", windowsVirtualKeyCode: vkOf(k), nativeVirtualKeyCode: vkOf(k),
+        code: `Key${k.toUpperCase()}`, key: k,
+      });
+    }
     await sleep(HOLD_MS);
   }
 
@@ -243,11 +246,15 @@ try {
   }
   await shot(zoomFile, zoomClip);
 
-  if (holdKey) {
-    await cdp.send("Input.dispatchKeyEvent", {
-      type: "keyUp", windowsVirtualKeyCode: holdKey.vk, nativeVirtualKeyCode: holdKey.vk,
-      code: holdKey.code, key: holdKey.key,
-    });
+  if (HOLD_KEY) {
+    const keys = HOLD_KEY.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
+    const vkOf = (k) => 65 + "abcdefghijklmnopqrstuvwxyz".indexOf(k);
+    for (const k of keys.reverse()) {
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "keyUp", windowsVirtualKeyCode: vkOf(k), nativeVirtualKeyCode: vkOf(k),
+        code: `Key${k.toUpperCase()}`, key: k,
+      });
+    }
   }
 
   const errors = cdp.console.filter((l) => /ERROR|error|SCRIPT/.test(l));

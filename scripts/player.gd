@@ -1,8 +1,18 @@
 extends CharacterBody3D
 ## 第三人称角色控制器。
 ##
-## 朝向策略：身体始终跟着镜头转（射击游戏常见的"侧移"手感），
-## 移动方向按镜头朝向换算，所以按 A/D 是横向平移，不是原地转身。
+## 朝向策略：**镜头与移动方向基准只由鼠标改变，方向键只平移 + 让身体偏转一点**。
+##   - 鼠标旋转 Player（镜头与外观都是它的子节点），这就是移动换算的参考系
+##   - W A S D 只改变速度，并让火柴人的身体偏转（见 _update_lean）
+##   - 镜头不跟随这个偏转，仍然只由鼠标控制
+##
+## 身体偏转的规则（用户指定，见 _update_lean）：横向输入决定偏哪侧，后退时横向镜像。
+## 于是偏转**不随移动方向单调变化**，不能用“朝移动方向限幅”那类公式实现。
+##
+## 试过让外观完全朝移动方向转、并让镜头跟着转，结果是方向键一按画面就转，
+## 操作失去参考（“朝屏幕里走”与 W 键的语义不再一致），已回退。
+## 若以后要再试，务必把移动换算的参考系与镜头旋转分开，否则会形成正反馈
+## （按 D → 右转 → 镜头转 → “右”又变成新的右 → 一直转圈）。
 ##
 ## 键位不写进 project.godot，而是在 _ensure_actions() 里用引擎常量注册，
 ## 避免手写键盘码出错；以后想改，直接在 Project Settings → Input Map 里加即可。
@@ -12,6 +22,10 @@ extends CharacterBody3D
 @export_range(0.0005, 0.01, 0.0005) var mouse_sensitivity: float = 0.0025
 @export var pitch_min_deg: float = -70.0
 @export var pitch_max_deg: float = 35.0
+## 身体随方向键偏转的最大角度（度）。“一点”到底多少由这里定，请自行试。
+@export_range(0.0, 89.0, 1.0) var lean_deg: float = 45.0
+## 偏转的逼近速度，越大转得越快。
+@export var lean_rate: float = 12.0
 
 @onready var _arm: SpringArm3D = $SpringArm
 
@@ -86,6 +100,7 @@ func _physics_process(delta: float) -> void:
 	if active:
 		want = Input.get_vector("move_left", "move_right", "move_forward", "move_back")
 	var dir := (transform.basis * Vector3(want.x, 0.0, want.y)).normalized()
+	_update_lean(want, delta)
 
 	if not is_on_floor():
 		velocity.y -= _gravity * delta
@@ -99,6 +114,48 @@ func _physics_process(delta: float) -> void:
 	# 步态用水平速度驱动：走快摆幅大、停下回直立、离地换空中姿势。
 	if figure != null:
 		figure.animate(Vector2(velocity.x, velocity.z).length(), is_on_floor(), delta)
+
+
+## 身体随方向键偏转一点，**不超过 lean_deg**。镜头不跟随这个偏转。
+##
+## 规则（用户指定）：**横向输入决定偏哪一侧，后退时横向镜像**。所以：
+##
+##   | 按键 | 移动 | 身体偏转 |
+##   | --- | --- | --- |
+##   | W / S | 前 / 后 | 0°（不偏） |
+##   | A / WA | 左 / 左前 | 左 lean_deg |
+##   | AS | 左后 | **右** lean_deg |
+##   | D / WD | 右 / 右前 | 右 lean_deg |
+##   | DS | 右后 | **左** lean_deg |
+##
+## 注意它**不随移动方向单调变化**（后退时镜像），因此不能用“身体朝移动方向、限幅”
+## 这类公式表达；写成乘法而不是分支，是为了让符号关系一眼可见。
+## 松手后回到直立（0°），不是保持偏转。
+func _update_lean(want: Vector2, delta: float) -> void:
+	if figure == null:
+		return
+	var target := 0.0
+	if absf(want.x) > 0.01:
+		# 前进一侧取负、后退一侧取正，实现“后退时镜像”。
+		var backward := 1.0 if want.y > 0.0 else -1.0
+		target = deg_to_rad(lean_deg) * signf(want.x) * backward
+	figure.rotation.y = lerp_angle(
+		figure.rotation.y, target, 1.0 - exp(-lean_rate * delta)
+	)
+
+
+## 火柴人当前的世界朝向（= 鼠标朝向 + 身体偏转）。
+##
+## 网络同步要发这个而不是 player.rotation.y：身体会偏转，只看 player 的话
+## 远端看到的脸朝向会与本体不一致（相差正好是偏转角）。
+func facing_yaw() -> float:
+	return rotation.y + (figure.rotation.y if figure != null else 0.0)
+
+
+## 镜头相对 Player 参考系多转了多少。方向键不应带动镜头，所以它应当恒为 0；
+## 留这个访问器是为了让自动化检查能断言这一点。
+func camera_offset_yaw() -> float:
+	return _arm.rotation.y if _arm != null else 0.0
 
 
 func _notification(what: int) -> void:

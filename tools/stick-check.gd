@@ -73,7 +73,11 @@ func _check_attachments(fig: Node, tag := "") -> void:
 	for name in ["hips", "neck"]:
 		if int(by_bone.get(name, {}).get("bar", 0)) < 1:
 			missing.append(name + ":横杆")
-	_check(missing.is_empty(), tag + "各部位的网格件齐全", " / ".join(missing) if not missing.is_empty() else "斜杆 12、关节球 8、横杆 2、头 1")
+	_check(missing.is_empty(), tag + "各部位的网格件齐全", " / ".join(missing) if not missing.is_empty()
+		else "竖杆 %d、关节球 %d、横杆 %d、头 %d、眼 %d" % [
+			int(_count_by_kind(fig).get("seg", 0)), int(_count_by_kind(fig).get("joint", 0)),
+			int(_count_by_kind(fig).get("bar", 0)), int(_count_by_kind(fig).get("head", 0)),
+			int(_count_by_kind(fig).get("eye", 0))])
 
 
 ## 按“骨骼 → 网格名 → 数量”整理。网格名在 stick_figure.gd 里设置。
@@ -91,11 +95,63 @@ func _meshes_by_bone(fig: Node) -> Dictionary:
 	return out
 
 
+## 把网格名归类（前缀匹配）。不用精确名：同一骨骼下同名子节点会被 Godot 自动改名。
+func _kind_of(mesh_name: String) -> String:
+	for kind in ["eye", "seg", "joint", "bar", "head"]:
+		if mesh_name.begins_with(kind):
+			return kind
+	return mesh_name
+
+
+## 按网格名汇总数量（跨骨骼），用于“件数符合设计”的说明文字。
+func _count_by_kind(fig: Node) -> Dictionary:
+	var out := {}
+	var by_bone := _meshes_by_bone(fig)
+	for bone in by_bone:
+		var counts: Dictionary = by_bone[bone]
+		for mesh_name in counts:
+			var kind := _kind_of(String(mesh_name))
+			out[kind] = int(out.get(kind, 0)) + int(counts[mesh_name])
+	return out
+
+
+## 眼睛必须长在脸的那一侧（-Z），否则会变成后脑勺上的两只眼。
+func _check_eyes(fig: Node, tag := "") -> void:
+	var head := _mesh_on(fig, "head", "head")
+	if head == null:
+		_check(false, tag + "能取到头")
+		return
+	var head_z := (head.global_transform * head.get_aabb()).get_center().z
+	var eyes := _meshes_matching(fig, "eye")
+	_check(eyes.size() == 2, tag + "有两只眼睛", "%d 只" % eyes.size())
+	var wrong := 0
+	var eye_z := 0.0
+	for eye in eyes:
+		var z := (eye.global_transform * eye.get_aabb()).get_center().z
+		eye_z += z
+		# 正面是 -Z，所以眼睛应当比头中心更靠 -Z。
+		if z >= head_z - 0.01:
+			wrong += 1
+	_check(wrong == 0, tag + "眼睛长在脸的前侧", "眼 z=%.3f、头中心 z=%.3f" % [
+		eye_z / maxf(1.0, float(eyes.size())), head_z])
+
+
 func _mesh_on(fig: Node, bone: String, mesh_name: String) -> MeshInstance3D:
 	for child in fig.get_node("Skeleton3D").get_children():
 		if child is BoneAttachment3D and child.bone_name == bone:
 			return child.get_node_or_null(mesh_name) as MeshInstance3D
 	return null
+
+
+func _meshes_matching(fig: Node, prefix: String) -> Array[MeshInstance3D]:
+	var out: Array[MeshInstance3D] = []
+	for child in fig.get_node("Skeleton3D").get_children():
+		if not (child is BoneAttachment3D):
+			continue
+		for sub in child.get_children():
+			if sub is MeshInstance3D and String(sub.name).begins_with(prefix):
+				out.append(sub)
+	return out
 
 
 ## 检查各部位在默认站姿下**确实相互接触**。
@@ -216,17 +272,31 @@ func _run_checks() -> void:
 	)
 
 	# 两套样式的半径、头形、附加件都不同，只验默认那套会漏掉另一套的几何问题。
+	var counts_by_style: Array[int] = []
 	for style_index in [0, 1]:
 		fig.apply_style(style_index)
 		var tag := "[%s] " % fig.style_name()
+		var kinds := _count_by_kind(fig)
+		var total := 0
+		var parts: Array[String] = []
+		for kind in ["seg", "joint", "bar", "head", "eye"]:
+			var n := int(kinds.get(kind, 0))
+			if n > 0:
+				parts.append("%s %d" % [kind, n])
+				total += n
+		counts_by_style.append(total)
+		# 说明文字按实际统计拼，不写死：曾经写死“斜杆 12”，而实际是 10，说明会说话。
 		_check(
-			_count_meshes(fig) >= 22,
-			tag + "网格件数符合设计（斜杆 12 + 关节球 8 + 横杆 2 + 头 1 + 朝向标记 1）",
-			str(_count_meshes(fig))
+			total > 0 and int(kinds.get("seg", 0)) + int(kinds.get("joint", 0))
+				+ int(kinds.get("bar", 0)) + int(kinds.get("head", 0))
+				+ int(kinds.get("eye", 0)) == total,
+			tag + "网格件数符合设计",
+			"共 %d（%s）" % [total, "、".join(parts)]
 		)
 		_check_attachments(fig, tag)
 		_check_connected(fig, tag)
 		_check_extras(fig, tag)
+		_check_eyes(fig, tag)
 
 	fig.apply_style(0)
 	_check_bone_heights(fig)
@@ -240,7 +310,11 @@ func _run_checks() -> void:
 	_check(color_a != color_b, "两套样式颜色不同", "%s %s / %s %s" % [
 		name_a, color_a.to_html(false), name_b, color_b.to_html(false)])
 	_check(name_a != name_b, "两套样式名称不同", "%s / %s" % [name_a, name_b])
-	_check(_count_meshes(fig) >= 23, "样式 B 多了胸横带", str(_count_meshes(fig)))
+	_check(
+		counts_by_style[1] == counts_by_style[0] + 1,
+		"样式 B 比 A 多一件（胸前横带）",
+		"%d / %d" % [counts_by_style[0], counts_by_style[1]]
+	)
 
 	# 取模：传超出范围的序号不应该崩
 	fig.apply_style(7)

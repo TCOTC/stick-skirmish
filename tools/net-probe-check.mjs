@@ -30,6 +30,15 @@ const ARG = process.argv[3];
 const MODE = ARG === "--room" ? "room" : ARG === "--walk" ? "walk" : "probe";
 const ROOM_NAME = process.env.TEST_ROOM ?? "roomtest";
 const WALK_ROOM = process.env.WALK_ROOM ?? "walktest";
+// 让第二个实例晚一点再加入，用来复现"一个人先开、另一个人后进"的真实场景。
+const JOIN_DELAY_MS = Number(process.env.TEST_JOIN_DELAY_MS ?? 0);
+
+// Godot 的高层 rpc 会用节点路径缓存来省带宽；缓存靠连接时的握手机制建立。
+// 中继不参与握手，所以后加入者可能收不到先加入者早先发过的路径公告，
+// 结果是包被丢掉并报 "ID 1 not found in cache of peer 1"。这类错误必须可见，
+// 否则“某个方向的更新静默丢失”会被漏掉。
+const RPC_ERROR = /not found in cache|Invalid packet received|Requested node was not found/;
+const rpcErrorCount = (cdp) => cdp.console.filter((l) => RPC_ERROR.test(l)).length;
 const CHROME = process.env.CHROME
   ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const DEBUG_PORT = 9333;
@@ -266,6 +275,50 @@ try {
 }
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "stick-netprobe-"));
+
+// 按键辅助与角度工具必须在**顶层主流程之前**定义。
+// 顶层 await 会暂停模块求值，声明写在下方的 const 会一直处于暂时性死区，
+// 主流程里调用就会报 "Cannot access 'VK' before initialization"。
+
+// Godot 网页版按 event.code 匹配物理键位，所以要一并给出 code 与虚拟键码。
+const VK = { KeyW: 87, KeyA: 65, KeyS: 83, KeyD: 68 };
+
+async function keyDown(cdp, code) {
+  const vk = VK[code];
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown", windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
+    code, key: code.slice(3).toLowerCase(),
+  });
+}
+
+async function keyUp(cdp, code) {
+  const vk = VK[code];
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "keyUp", windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk,
+    code, key: code.slice(3).toLowerCase(),
+  });
+}
+
+/** 点击画面：请求全屏并接管鼠标。键盘只在指针锁定后才生效。 */
+async function clickToCapture(cdp) {
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+  for (let i = 0; i < 25; i++) {
+    if (await cdp.evaluate("!!document.pointerLockElement")) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+/** 把角度差归一化到 -180..180。 */
+function angleDiff(a, b) {
+  return ((a - b) % 360 + 540) % 360 - 180;
+}
+
 // 走路模式只需要一个实例，而且不能有别的客户端：位置变化要来自真实的键盘输入。
 const instances = MODE === "walk"
   ? [{ key: "a", name: "alpha", port: DEBUG_PORT }]
@@ -309,6 +362,10 @@ try {
     const url = MODE === "probe"
       ? `${BASE}/index.html?probe=1&name=${inst.name}`
       : `${BASE}/index.html${pageQuery}`;
+    if (JOIN_DELAY_MS > 0 && inst.key === "b") {
+      console.log(`  ${inst.name} 延迟 ${JOIN_DELAY_MS} ms 再加入…`);
+      await sleep(JOIN_DELAY_MS);
+    }
     console.log(`  ${inst.name} → ${url}`);
     await inst.cdp.send("Page.navigate", { url });
   }
@@ -394,19 +451,7 @@ async function checkWalk() {
   await sleep(1500);
 
   // 点击画面 = 请求全屏 + 接管鼠标（由注入脚本串起来）。键盘只在锁定后生效。
-  await cdp.send("Input.dispatchMouseEvent", {
-    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
-  });
-  await cdp.send("Input.dispatchMouseEvent", {
-    type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
-  });
-
-  let locked = false;
-  for (let i = 0; i < 25; i++) {
-    locked = await cdp.evaluate("!!document.pointerLockElement");
-    if (locked) break;
-    await sleep(200);
-  }
+  const locked = await clickToCapture(cdp);
   if (locked) usedPointerLock = true;   // 收尾时要用到：先释放再强杀
   console.log(`  指针锁定: ${locked}`);
 
@@ -419,9 +464,8 @@ async function checkWalk() {
   }
   const idleMax = idleLegs.length ? Math.max(...idleLegs) : 0;
 
-  // W 键对应 Godot 的 move_forward。Godot 网页版按 event.code 匹配物理键位。
-  const KEY_W = { windowsVirtualKeyCode: 87, nativeVirtualKeyCode: 87, code: "KeyW", key: "w" };
-  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...KEY_W });
+  // W 键对应 Godot 的 move_forward。
+  await keyDown(cdp, "KeyW");
 
   const startPos = (await readStat(cdp))?.pos ?? null;
   const walkLegs = [];
@@ -435,7 +479,7 @@ async function checkWalk() {
     await sleep(50);
   }
   const endPos = (await readStat(cdp))?.pos ?? null;
-  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...KEY_W });
+  await keyUp(cdp, "KeyW");
 
   const legRange = walkLegs.length ? Math.max(...walkLegs) - Math.min(...walkLegs) : 0;
   const armRange = walkArms.length ? Math.max(...walkArms) - Math.min(...walkArms) : 0;
@@ -443,15 +487,79 @@ async function checkWalk() {
     ? Math.hypot(endPos[0] - startPos[0], endPos[2] - startPos[2])
     : 0;
 
-  console.log("");
+  // 逐键验证身体偏转表。这条规则**反直觉**（后退时横向镜像，所以 A 左倾而 AS 右倾），
+  // 又不能用“朝移动方向限幅”那类公式概括，所以必须逐键锁住。
+  //
+  // 同时断言：方向键**不带动镜头**、也**不带动移动基准**（Player 节点）。
+  // 曾经让外观完全朝移动方向转、镜头也跟着转，结果一按方向键画面就转，操作失去参考。
+  const bodyBefore = (await readStat(cdp))?.figure?.bodyYawDeg ?? 0;
+  const leanCases = [
+    { keys: ["KeyA"], label: "按 A（左）", expect: 1 },
+    { keys: ["KeyD"], label: "按 D（右）", expect: -1 },
+    { keys: ["KeyA", "KeyS"], label: "按 AS（左后）", expect: -1 },
+    { keys: ["KeyD", "KeyS"], label: "按 DS（右后）", expect: 1 },
+    { keys: ["KeyW"], label: "按 W（前）", expect: 0 },
+    { keys: ["KeyS"], label: "按 S（后）", expect: 0 },
+  ];
+  const leans = [];
+  for (const c of leanCases) {
+    for (const k of c.keys) await keyDown(cdp, k);
+    const p0 = (await readStat(cdp))?.pos ?? null;
+    await sleep(1100);                 // 等偏转与镜头都稳定
+    const s = await readStat(cdp);
+    for (const k of c.keys) await keyUp(cdp, k);
+    const p1 = (await readStat(cdp))?.pos ?? null;
+    await sleep(700);                  // 松手后让偏转回落到直立
+    const after = await readStat(cdp);
+    const moved = p0 && p1
+      ? Math.hypot(p1[0] - p0[0], p1[2] - p0[2])
+      : 0;
+    leans.push({
+      ...c,
+      lean: s?.figure?.leanDeg ?? 0,
+      cam: s?.figure?.camYawDeg ?? 0,
+      body: s?.figure?.bodyYawDeg ?? 0,
+      released: after?.figure?.leanDeg ?? 0,
+      moved,
+    });
+  }
+
+  const byLabel = Object.fromEntries(leans.map((l) => [l.label, l]));
+  const signOk = (v, e) => (e === 0
+    ? Math.abs(v) < 2.0
+    : Math.sign(v) === e && Math.abs(v) > 10.0 && Math.abs(v) < 89.0);
+  const maxAbsLean = Math.max(...leans.map((l) => Math.abs(l.lean)));
+  const maxCamDrift = Math.max(...leans.map((l) => Math.abs(l.cam)));
+  const maxBodyDrift = Math.max(...leans.map((l) => Math.abs(angleDiff(l.body, bodyBefore))));
+  const maxReleased = Math.max(...leans.map((l) => Math.abs(l.released)));
+  const mirrored = Math.sign(byLabel["按 A（左）"].lean)
+    === -Math.sign(byLabel["按 AS（左后）"].lean)
+    && Math.sign(byLabel["按 D（右）"].lean) === -Math.sign(byLabel["按 DS（右后）"].lean);
+
   const results = [
     ["点击画面后指针被锁定", locked, "键盘只在锁定后生效"],
     ["静置时腿是直的", idleMax < 0.1, `最大 |角度| = ${idleMax.toFixed(3)} 弧度`],
     ["走动时腿在前后摆", legRange > 0.6, `摆幅 ${legRange.toFixed(2)} 弧度`],
     ["走动时手臂在反相摆", armRange > 0.3, `摆幅 ${armRange.toFixed(2)} 弧度`],
     ["按住 W 时角色确实移动了", moved > 1.0, `水平位移 ${moved.toFixed(2)} 米`],
+    ...leans.map((l) => [
+      `${l.label} 的身体偏转`,
+      signOk(l.lean, l.expect),
+      `${l.lean.toFixed(1)}°（期望${l.expect === 0 ? "直立" : l.expect > 0 ? "左倾" : "右倾"}）`,
+    ]),
+    ["偏转不超过 90°", maxAbsLean < 89.0, `最大 ${maxAbsLean.toFixed(1)}°`],
+    ["后退时横向镜像（A 与 AS 相反）", mirrored,
+      `A ${byLabel["按 A（左）"].lean.toFixed(1)}° / AS ${byLabel["按 AS（左后）"].lean.toFixed(1)}°`],
+    ["松手后回到直立", maxReleased < 3.0, `最大残留 ${maxReleased.toFixed(1)}°`],
+    ["方向键不带动镜头", maxCamDrift < 1.0, `最大漂移 ${maxCamDrift.toFixed(2)}°`],
+    ["方向键不带动移动基准", maxBodyDrift < 1.0, `最大漂移 ${maxBodyDrift.toFixed(2)}°`],
+    ["按 D 仍能侧移", byLabel["按 D（右）"].moved > 1.0,
+      `水平位移 ${byLabel["按 D（右）"].moved.toFixed(2)} 米`],
+    ["接收过程没有 RPC 路径解析错误", rpcErrorCount(cdp) === 0,
+      `${rpcErrorCount(cdp)} 条`],
   ];
 
+  console.log("");
   console.log("  结论:");
   for (const [label, ok, detail] of results) {
     console.log(`  ${ok ? "✓" : "✗"} ${label} — ${detail}`);
@@ -518,6 +626,40 @@ async function checkRoom() {
 
   // 两个实例是同时启动的，谁先连上不确定，所以只要求是 0 与 1 各一个。
   const ranks = [a.myRank, b.myRank].sort();
+
+  // --- 朝向同步：用鼠标真实转向，再看远端替身有没有跟上 ---
+  //
+  // 方向键现在不带动任何旋转（只有鼠标会），所以转向必须用鼠标事件来制造。
+  // 指针锁定下 Chrome 会用 x/y 的差值算出 movementX，Godot 的 _unhandled_input 据此旋转。
+  const alphaInst = instances.find((i) => i.name === "alpha");
+  await alphaInst.cdp.send("Page.bringToFront");
+  await sleep(500);
+  const alphaLocked = await clickToCapture(alphaInst.cdp);
+  if (alphaLocked) usedPointerLock = true;
+
+  const yawBefore = (await readStat(alphaInst.cdp))?.figure?.bodyYawDeg ?? 0;
+  for (let i = 0; i < 12; i++) {
+    await alphaInst.cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: 300 + i * 40, y: 360, buttons: 0,
+    });
+    await sleep(60);
+  }
+  // 等 Godot 把队列里的事件都处理完、朝向稳定下来再读。
+  // 发完事件立刻就读会拿到中途值，把“采样时机”误判成“没有转动”。
+  await sleep(1500);
+  const yawAfter = (await readStat(alphaInst.cdp))?.figure?.bodyYawDeg ?? 0;
+  const mouseTurned = Math.abs(angleDiff(yawAfter, yawBefore)) > 5;
+
+  // 再等替身的插值收敛，然后同时读两侧，避免把“采样错位”当成朝向不一致。
+  await sleep(1000);
+  const lastAlpha = await readStat(alphaInst.cdp);
+  const betaInst = instances.find((i) => i.name === "beta");
+  const lastBeta = await readStat(betaInst.cdp);
+  const selfFacing = lastAlpha?.figure?.facingDeg ?? 0;
+  const remoteFacing = lastBeta?.avatarYawDeg?.[String(lastAlpha?.myId)] ?? null;
+  const facingGap = remoteFacing === null ? 999 : Math.abs(angleDiff(remoteFacing, selfFacing));
+  const rpcErrors = instances.reduce((sum, i) => sum + rpcErrorCount(i.cdp), 0);
+
   const results = [
     ["两个客户端都进入已连接状态", a.connected && b.connected,
       `alpha ${a.status} / beta ${b.status}`],
@@ -532,6 +674,10 @@ async function checkRoom() {
     ["替身样式与对方的进入顺序一致",
       a.peerRanks[String(b.myId)] === b.myRank && b.peerRanks[String(a.myId)] === a.myRank,
       `alpha 眼中 beta=${a.peerRanks[String(b.myId)]} / beta 眼中 alpha=${b.peerRanks[String(a.myId)]}`],
+    ["鼠标转向后远端替身朝向跟随", mouseTurned && facingGap < 15,
+      `本体朝向 ${selfFacing.toFixed(1)}°，远端替身 ${remoteFacing === null ? "无" : remoteFacing.toFixed(1) + "°"}（差 ${facingGap.toFixed(1)}°）`],
+    ["接收过程没有 RPC 路径解析错误", rpcErrors === 0,
+      `${rpcErrors} 条（路径缓存丢失会让更新静默丢失）`],
   ];
 
   console.log("  结论:");

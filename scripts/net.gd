@@ -146,6 +146,9 @@ func _on_connected() -> void:
 	_player.global_position.x += SPAWN_X_OFFSET if (my_id % 2 == 0) else -SPAWN_X_OFFSET
 	print("[net] 出生点 ", _player.global_position)
 	_refresh_styles()
+	# 无条件应用一次：_refresh_styles 只在「位次变了」时才会调它，
+	# 而位次是 0 时“没变”，于是初始化就依赖了“默认样式正好是 0 号”这个巧合。
+	_apply_my_style()
 
 
 func _find_player() -> Node3D:
@@ -165,7 +168,18 @@ func _send_state(delta: float) -> void:
 		return
 	_acc = 0.0
 	# 广播：中继不做定向，rpc() 默认就是发给所有对端。
-	rpc("_peer_state", my_id, _player.global_position, _player.rotation.y)
+	# 发的是**视觉朝向**（火柴人面朝哪边），不是 player.rotation.y（镜头朝向）：
+	# 本地火柴人跟着移动方向转，发镜头朝向的话双方看到的脸就不一致了。
+	rpc("_peer_state", my_id, _player.global_position, _visual_yaw())
+
+
+## 问玩家节点要当前的外观朝向。外观策略属于 player.gd，这里不自己拼 rotation.y。
+func _visual_yaw() -> float:
+	if _player == null:
+		return 0.0
+	if _player.has_method("facing_yaw"):
+		return float(_player.call("facing_yaw"))
+	return _player.rotation.y
 
 
 ## 收到的每个包都会被标成来自 1 号，所以发送者身份只能自己写在参数里。
@@ -333,11 +347,25 @@ func _publish() -> void:
 			"style": _style_name(_my_rank),
 			"legAngle": snappedf(figure.bone_angle("upper_leg_l"), 0.001),
 			"armAngle": snappedf(figure.bone_angle("upper_arm_l"), 0.001),
+			# 报告**实际广播出去**的那个朝向（facing_yaw），而不是某个节点的 rotation.y。
+			# 曾经报的是 figure.rotation.y：改成“外观不再自己转身”后它恒为 0，
+			# 于是“报告的量”与“同步的量”悄悄分家，检查会得出无意义的结论。
+			"facingDeg": snappedf(rad_to_deg(_visual_yaw()), 0.1),
+			# 鼠标控制的那个节点（移动基准）的朝向，用于断言“方向键不带动它”。
+			"bodyYawDeg": snappedf(rad_to_deg(_player.rotation.y), 0.1) if _player != null else 0.0,
+			# 身体随方向键的偏转，用于验证那张偏转表（后退时镜像）。
+			"leanDeg": snappedf(rad_to_deg(figure.rotation.y), 0.1),
+			"camYawDeg": snappedf(rad_to_deg(_cam_offset()), 0.1),
 		}
 
 	var pos := Vector3.ZERO
 	if _player != null:
 		pos = _player.global_position
+
+	# 替身的世界朝向。房间模式用它验证“远端看到的脸朝向”与本体一致。
+	var avatar_yaw := {}
+	for id in _avatars:
+		avatar_yaw[str(id)] = snappedf(rad_to_deg(_avatars[id].rotation.y), 0.1)
 
 	var snapshot := {
 		"room": room,
@@ -350,6 +378,7 @@ func _publish() -> void:
 		"peers": _targets.keys(),
 		"peerRanks": ranks,
 		"avatars": _avatars.size(),
+		"avatarYawDeg": avatar_yaw,
 		"figure": figure_info,
 		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
 	}
@@ -359,3 +388,10 @@ func _publish() -> void:
 func _style_name(rank: int) -> String:
 	var styles: Array = StickFigureScript.STYLES
 	return str(styles[((rank % styles.size()) + styles.size()) % styles.size()]["name"])
+
+
+## 镜头相对玩家参考系的偏转。相机跟随外观，所以它应当与 facingDeg 一致。
+func _cam_offset() -> float:
+	if _player != null and _player.has_method("camera_offset_yaw"):
+		return float(_player.call("camera_offset_yaw"))
+	return 0.0

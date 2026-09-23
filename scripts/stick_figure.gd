@@ -25,7 +25,11 @@ extends Node3D
 ##
 ## 坐标约定：脚本节点的原点是**脚底**，与 CharacterBody3D 的碰撞胶囊底部对齐。
 
-## 细杆半径。火柴人靠“细线 + 关节”辨识，圆柱太粗就会连成一根管子，不像火柴。
+## 两套样式的差异都在这里。radius 是细杆半径：火柴人靠“细线 + 关节”辨识，
+## 圆柱太粗（曾用 4.3~5.2 cm）就会连成一根管子，不像火柴。
+##
+## 眼睛的位置、大小都按 head_size 比例算，两套头形只需各自给出“前表面在哪”。
+## eye_surface 是头中心到前表面的距离（球头取 0.88 是因为该高度上的球面会往内收）。
 const STYLES: Array = [
 	{
 		"name": "ember",
@@ -34,6 +38,7 @@ const STYLES: Array = [
 		"radius": 0.021,
 		"head_shape": "sphere",
 		"head_size": 0.115,
+		"eye_surface": 0.88,
 		"chest_band": false,
 	},
 	{
@@ -43,9 +48,12 @@ const STYLES: Array = [
 		"radius": 0.017,
 		"head_shape": "box",
 		"head_size": 0.105,
+		"eye_surface": 1.0,
 		"chest_band": true,
 	},
 ]
+
+const EYE_COLOR := Color(0.06, 0.05, 0.08)   # 深色，在两种头色上都读得出是眼睛
 
 const HIPS_HEIGHT := 0.93    # 髖骨高度（骨盆横杆与大腿根就在这里）
 const SPINE_LEN := 0.58      # 骨盆到肩
@@ -140,6 +148,7 @@ var _skeleton: Skeleton3D = null
 var _bones: Dictionary = {}
 var _limb_mat: StandardMaterial3D = null
 var _head_mat: StandardMaterial3D = null
+var _eye_mat: StandardMaterial3D = null
 var _phase := 0.0
 var _amp := 0.0
 var _air := 0.0
@@ -195,6 +204,9 @@ func _rebuild() -> void:
 	_head_mat = StandardMaterial3D.new()
 	_head_mat.albedo_color = style["head"]
 	_head_mat.roughness = 0.5
+	_eye_mat = StandardMaterial3D.new()
+	_eye_mat.albedo_color = EYE_COLOR
+	_eye_mat.roughness = 0.35
 
 	_skeleton = Skeleton3D.new()
 	_skeleton.name = "Skeleton3D"
@@ -316,16 +328,30 @@ func _add_head(style: Dictionary, radius: float) -> void:
 	head.material_override = _head_mat
 	attach.add_child(head)
 
-	# 朝向标记：火柴人的杆是轴对称的，没有它就分不出面朝哪边。
-	var nose := MeshInstance3D.new()
-	nose.name = "nose"
-	var nose_box := BoxMesh.new()
-	var nose_size := head_size * 0.4
-	nose_box.size = Vector3(nose_size, nose_size, nose_size * 1.6)
-	nose.mesh = nose_box
-	nose.position = Vector3(0.0, head_size * 0.75, -head_size * 1.0)
-	nose.material_override = _limb_mat
-	attach.add_child(nose)
+	_add_eyes(style, head_size, attach)
+
+
+## 两只眼睛。做得比“朝向标记”更像一张脸，同时仍然解决“轴对称分不出一朝向”的问题。
+func _add_eyes(style: Dictionary, head_size: float, attach: BoneAttachment3D) -> void:
+	var eye_r := head_size * 0.17
+	var center_y := head_size * 0.75
+	var surface := head_size * float(style["eye_surface"])
+	# 向 -Z 偏移：火柴人的正面是 -Z（与 player.gd 的朝向换算一致）。
+	var z := -(surface + eye_r * 0.25)
+	var sides := [[-1.0, "eye_l"], [1.0, "eye_r"]]
+	for entry in sides:
+		var eye := MeshInstance3D.new()
+		# 名字必须区分左右：同名子节点会被 Godot 自动改名，自检按名字统计就会漏。
+		eye.name = entry[1]
+		var sphere := SphereMesh.new()
+		sphere.radius = eye_r
+		sphere.height = eye_r * 2.0
+		sphere.radial_segments = 8
+		sphere.rings = 4
+		eye.mesh = sphere
+		eye.position = Vector3(float(entry[0]) * head_size * 0.42, center_y + head_size * 0.20, z)
+		eye.material_override = _eye_mat
+		attach.add_child(eye)
 
 
 ## 样式 B 专属：胸前横带，让两套样式在远处也能一眼分开。
