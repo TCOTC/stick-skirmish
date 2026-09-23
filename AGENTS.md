@@ -39,6 +39,23 @@
   --path 'D:\Datafile\stick-skirmish' --quit-after 60
 ```
 
+火柴人的骨骼与步态自检（不联网，直接读骨骼角度）：
+
+```powershell
+& 'D:\Tool\Godot\4.7.2\Godot_v4.7.2-stable_win64_console.exe' --headless `
+  --path 'D:\Datafile\stick-skirmish' --script res://tools/stick-check.gd
+```
+
+给网页版截图（需要服务已在运行；直接给出 PNG 路径就能看图）：
+
+```powershell
+node tools/shot.mjs                                              # 整屏 + 中央放大（写到系统临时目录）
+node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\a.png --stat     # 同时输出游戏状态
+node tools/shot.mjs https://127.0.0.1:8001 $env:TEMP\w.png --key w --center 150,230,30   # 按住 W 拍走路姿态
+```
+
+输出路径**不要写进项目目录**（会被 Godot 当资源导出，见下方“已经踩过的坑”）。
+
 导出网页版（**`build/` 目录必须先存在**，Godot 不会自动创建）：
 
 ```powershell
@@ -57,25 +74,36 @@ node tools/serve.mjs
 ```powershell
 node tools/relay-selftest.mjs
 node tools/net-probe-check.mjs https://127.0.0.1:8001
+node tools/net-probe-check.mjs https://127.0.0.1:8001 --room
+node tools/net-probe-check.mjs https://127.0.0.1:8001 --walk
 ```
 
 ## 验证手段
 
-**AI 看不到画面**（不支持图像输入），"好不好看"必须由人判断。但结构和行为可以自动验证：
+**AI 能看画面**：`node tools/shot.mjs` 会驱动无头 Chrome 打开网页版并截图，
+返回的 PNG 可以直接看图（曾经以为不支持图像输入，结果把一个“角色只剩头和躯干”的
+明显缺陷推给了人去看）。截图工具支持 `--clip x,y,w,h`、`--zoom`、`--key w`（按住键拍走路姿态）。
+
+除图像之外，结构与行为都能自动验证：
 
 - 无头跑一遍查错
 - 用 CDP 驱动真实 Chrome：注入脚本、派发**真实**鼠标键盘事件、截图、读 DOM
-- **像素比对**判断"角色动没动"：同场景两帧平均差 `0.00/765` = 完全没动，
-  `5~6/765` = 确实移动了。这个判据在本项目里反复用过，比"看起来对"可靠得多
+- 读骨骼 / 节点的**数值**：如 `tools/stick-check.gd` 直接读骨骼 pose，判断关节有没有在动
+- **像素比对**判断“角色动没动”：同场景两帧平均差 `0.00/765` = 完全没动，
+  `5~6/765` = 确实移动了。这个判据在本项目里反复用过，比“看起来对”可靠得多
 
 CDP 测试的两个坑：
 
 - 无头 Chrome 默认不给页面前台焦点 → 指针锁会失败并报
   `WrongDocumentError: The root document ... not valid for pointer lock`。
   先发 `Page.bringToFront`，确认 `document.hasFocus()` 为 true。
-- **测完一定要调 `ClipCursor(NULL)` 解除鼠标裁剪。** 浏览器进入指针锁定时会把光标圈在窗口内，
-  进程异常退出会留下孤儿限制，症状是"鼠标被困在屏幕左上角动不了"。
-  `tools/free-cursor.ps1` 专门干这个，别忘了。
+- **测完一定要解除鼠标裁剪（`ClipCursor`）。** 浏览器进入指针锁定时会把光标圈在窗口内，
+  进程被强杀时来不及还原，限制就留在系统里，症状是"鼠标被困在屏幕左上角动不了"。
+  现在由 `tools/net-probe-check.mjs` 自动收尾（先 `exitPointerLock` → 优雅关闭页面 →
+  兜底跑 `free-cursor.ps1`），所以用它跑测试不需要手动处理。
+  但**用别的方式驱动浏览器时仍需手动跑 `tools/free-cursor.ps1`**。
+  注意：强杀（`taskkill /F`）会跳过浏览器的窗口销毁流程，而还原就发生在那里，
+  所以收尾要先让页面自己关。
 
 ## 已经踩过并修好的坑（别踩第二遍）
 
@@ -103,18 +131,43 @@ CDP 测试的两个坑：
   首帧渲染超过 3 秒（软件渲染、冷启动）时，第一次 `poll()` 已超时 → 判定失败并放弃连接。
   此时 `poll()` 会因已断开而**永远直接返回**，底层 socket 却还是 `OPEN`、关闭码 `-1`、没有报错；
   `_clear()` 也不关闭 socket、不重置超时。`scripts/net.gd` 因此设为 20 秒。
-- **导出预设是 `all_resources`，会把 `certs/lan.key` 打进 `index.pck`**，随页面发给局域网内任何人；
-  `build/` 里的 `.import` 也会被扫描。需要加 `exclude_filter`，或在 `build/` 放一个 `.gdignore`。
+- **headless 与 `--script` 模式不写 `.godot` 里的全局类缓存**，因此在那两种模式下直接用
+  `class_name`（如 `StickFigure`）会报 `Could not find type`。要用 `preload(...)` 引用。
+- **`--script` 运行的脚本里，函数返回值赋给 `:=` 变量会推断失败**（因为类型是 Variant），
+  需要写显式类型注解，否则报 `Cannot infer the type of ...`。
+- **导出预设是 `all_resources`，会把项目里的一切都打进 `index.pck`**，并随页面发给局域网内任何人
+  （曾经连 `certs/lan.key` 私钥一起发）。现在 `export_presets.cfg` 里有
+  `exclude_filter="certs/*, tools/*"` 把它们排掉了，加新目录时记得同步。
+  另外：**不要往项目目录里写截图或其它图片**——Godot 会把它们导成资源并打进包，
+  实测多几张 PNG 就让 `index.pck` 从 59 KB 涨到 84 KB。`tools/shot.mjs` 默认写到系统临时目录。
+- **`Skeleton3D` 的 rest 与 pose 是两回事。** `add_bone()` 把两者都设成单位矩阵，
+  `set_bone_rest()` 只改 rest；而 `BoneAttachment3D` 跟随的是 **pose**（`get_bone_global_pose()`）。
+  只设 rest 的话所有骨头都堆在骨骼原点，角色缩成一团——曾表现为“头在 1.04 米、脚在 0.70 米”，
+  画面上只剩一个头和一根竖线，而骨骼数量、网格数量、关节角度全都“正常”。建骨时 pose 要一并设。
+- **`BoneAttachment3D` 要在入树之后再设 `bone_name`。** 反过来写（先设名再 `add_child`）
+  在当前帧 `get_bone_idx()` 仍是 -1，要跑过一帧才解析出来。运行时看不出差别，
+  但无头自检里会得到一个假的“未绑定”报告，容易误判。
+- **`--script` 运行的脚本里，`_initialize()` 阶段读 `BoneAttachment3D.get_bone_idx()` 一定是 -1**
+  （解析发生在帧内的内部处理）。自检要放到 `_process()` 的第一帧之后跑，见 `stick-check.gd`。
+- **同一根骨头只留一个 `BoneAttachment3D`。** 每个网格各建一个附件时，同一骨骼的多个附件
+  会在按骨骼统计网格时彼此覆盖（自检会误报“缺件”），节点数也平白翻倍。见 `stick_figure._attach()`。
+- **火柴人的 Y 方向约定：躯干从骨盆向上长，四肢从骨骼原点向下垂。**
+  偏移符号写反不报错，只是那一段挂到身体外面去——实测把胸前横带的偏移写成负值，
+  它就横架到两条大腿上了。所以自检里有一项用外包围盒验证部件两两相交。
+- **点击画面会触发全屏，视口尺寸随之改变**（无头实测 1258x566 → 800x544），
+  写死的截图裁剪坐标会捕空。要按当前视口算，或直接用 `shot.mjs --center`。
+- **HUD 准星就在画面正中央**，截图放大时它会压在角色躯干上，看起来像角色身上的一个青色方块
+  （色值 `0.23,0.88,1`）。别把它当成模型缺陷去查。
 
 ## 人机分工
 
 AI 能做（不用打开编辑器）：改 GDScript、改 `.tscn`、导出网页版、无头查错、
-CDP 驱动真浏览器验证、像素比对。
+CDP 驱动真浏览器验证、截图看图、像素比对、读骨骼角度。
 
-AI 做不了：**判断好不好看**（看不到画面）、**判断手感**（没有手）、
+AI 做不了：**判断手感**（没有手）、**判断“这个数值好不好玩”**（射速、跳跃高度这类偏好的事）、
 编辑器里点按钮的步骤（装模板、InputMap 图形界面）没有命令行等价物。
 
-正常节奏：AI 改 + 导出 + 自动化验证 → 人玩一遍说"哪里不对劲" → 回到第一步。
+正常节奏：AI 改 + 导出 + 自动化验证 + 自己先看一遍截图 → 人玩一遍说"哪里不对劲" → 回到第一步。
 
 ## 当前进度
 
@@ -123,6 +176,8 @@ AI 做不了：**判断好不好看**（看不到画面）、**判断手感**（
 - 项目骨架、Compatibility 渲染器、网页导出预设
 - 对称竞技场（地板 + 13 个掩体 + 四周边界，由 `scripts/arena.gd` 数据生成）
 - 第三人称角色（`scripts/player.gd`）：镜头相对移动、鼠标视角、重力跳跃、SpringArm 镜头避障
+- 火柴人角色（`scripts/stick_figure.gd`）：Skeleton3D 骨骼绑定，走路 / 跳跃 / 站立的程序化步态，
+  两套样式按进入房间的顺序分配
 - 网页导出 → 局域网 HTTPS 服务 → 浏览器里真实渲染出场景，整条链路验证通过
 - 全屏与鼠标锁定：左键点击画面 = 全屏 + 接管鼠标；Esc = 释放鼠标 + 退全屏
 - 联机传输：`tools/ws-relay.mjs`（零依赖中继，16 项单测）+ 两个无头浏览器实测；

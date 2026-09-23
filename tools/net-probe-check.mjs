@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
- * 用 CDP 驱动两个真实 Chrome 实例，验证联机链路。两个模式：
+ * 用 CDP 驱动真实 Chrome 实例，验证联机链路。三个模式：
  *
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001]            # 传输层探针
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --room     # 双方能不能看见对方
+ *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --walk     # 走路时关节有没有在动
  *
  * 探针模式跑 scripts/net_probe.gd（需 ?probe=1），检查 wss 连接、中继转发、
  * Godot 高层 API 与广播 rpc；房间模式跑 scripts/net.gd，检查两个客户端进入同一房间后
- * 互相看到对方的替身。
+ * 互相看到对方的替身与样式分配；走路模式注入真实的鼠标点击与键盘事件，
+ * 读取火柴人的关节角度与自身位置，验证“走路时腿真的在摆、人真的在动”。
  *
  * 前置：另开一个终端跑 node tools/serve.mjs。
  *
@@ -21,10 +23,13 @@ import http from "node:http";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const BASE = (process.argv[2] ?? "https://127.0.0.1:8001").replace(/\/$/, "");
-const MODE = process.argv[3] === "--room" ? "room" : "probe";
+const ARG = process.argv[3];
+const MODE = ARG === "--room" ? "room" : ARG === "--walk" ? "walk" : "probe";
 const ROOM_NAME = process.env.TEST_ROOM ?? "roomtest";
+const WALK_ROOM = process.env.WALK_ROOM ?? "walktest";
 const CHROME = process.env.CHROME
   ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const DEBUG_PORT = 9333;
@@ -159,6 +164,76 @@ function kill(child) {
   }
 }
 
+/**
+ * 收尾的第一步：让页面自己关掉，浏览器随之退出。
+ *
+ * 为什么不直接 taskkill：/F 是强杀，会跳过浏览器的窗口销毁流程，
+ * 而 Windows 的鼠标裁剪（ClipCursor）就是在那个流程里还原的。
+ * 上次把鼠标困在屏幕角落，根因就是这个（详见 free-cursor.ps1 的注释）。
+ * 优雅关闭失败时仍会强杀，否则会留下卡住的进程。
+ */
+async function stopInstances() {
+  for (const inst of instances) {
+    if (!inst.cdp) continue;
+    try {
+      await inst.cdp.send("Page.close");
+    } catch {
+      // 页面可能已经没了
+    }
+  }
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (running.every((child) => child.exitCode !== null || child.killed)) break;
+    await sleep(200);
+  }
+  for (const child of running) kill(child);
+}
+
+// 指针锁定被触发过之后，收尾还要额外做两件事：
+//
+//   1. 先让页面主动调用 exitPointerLock，这是能正确还原的那条路径；
+//   2. 关闭之后兜底调一次 free-cursor.ps1，防止上一步没跑成。
+let usedPointerLock = false;
+
+async function releasePointerLock() {
+  if (!usedPointerLock) return;
+  for (const inst of instances) {
+    if (!inst.cdp) continue;
+    try {
+      // exitPointerLock 是异步的，页面还要跑一帧才会真正交还指针。
+      await inst.cdp.evaluate("document.exitPointerLock && document.exitPointerLock()");
+    } catch {
+      // 页面可能已经关了
+    }
+  }
+  await sleep(600);
+}
+
+/** 兜底：调用项目自带的脚本把系统的裁剪范围清掉（幂等，没限制时也无害）。 */
+function clearClipCursor() {
+  if (!usedPointerLock) return;
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "free-cursor.ps1");
+  if (!fs.existsSync(script)) return;
+  try {
+    const out = execFileSync(
+      "powershell",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+      { encoding: "utf8" }
+    );
+    // 不要去找中文关键字：脚本用 Write-Host 输出，捕获时会被按控制台代码页解码，
+    // 中文会变成乱码；但数字和逗号是 ASCII，不受影响。取最后一组数字（解除后的值）。
+    const rects = [...out.matchAll(/(\d+),(\d+)\s*-\s*(\d+),(\d+)/g)];
+    if (rects.length) {
+      const r = rects[rects.length - 1];
+      console.log(`  鼠标裁剪范围已恢复：${r[1]},${r[2]} - ${r[3]},${r[4]}`);
+    } else {
+      console.log("  已调用 tools/free-cursor.ps1 兜底清理鼠标裁剪");
+    }
+  } catch (err) {
+    console.log(`  ⚠ 解除鼠标裁剪失败，可手动运行 tools/free-cursor.ps1（${err.message}）`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 // 自签证书在浏览器里点过「继续前往」就没事，但 Node 的 fetch 会直接拒绘，
@@ -191,17 +266,28 @@ try {
 }
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "stick-netprobe-"));
-const instances = [
-  { key: "a", name: "alpha", port: DEBUG_PORT },
-  { key: "b", name: "beta", port: DEBUG_PORT + 1 },
-];
+// 走路模式只需要一个实例，而且不能有别的客户端：位置变化要来自真实的键盘输入。
+const instances = MODE === "walk"
+  ? [{ key: "a", name: "alpha", port: DEBUG_PORT }]
+  : [
+    { key: "a", name: "alpha", port: DEBUG_PORT },
+    { key: "b", name: "beta", port: DEBUG_PORT + 1 },
+  ];
 
 const pageQuery = MODE === "room"
   ? `?room=${encodeURIComponent(ROOM_NAME)}`
-  : null;
+  : MODE === "walk"
+    ? `?room=${encodeURIComponent(WALK_ROOM)}`
+    : null;
+
+const MODE_LABEL = {
+  room: `房间联机（room=${ROOM_NAME}）`,
+  walk: `走路动画（room=${WALK_ROOM}）`,
+  probe: "传输层探针",
+}[MODE];
 
 console.log(`  检查地址: ${BASE}`);
-console.log(`  检查模式: ${MODE === "room" ? `房间联机（room=${ROOM_NAME}）` : "传输层探针"}`);
+console.log(`  检查模式: ${MODE_LABEL}`);
 console.log(`  临时配置目录: ${tmpRoot}`);
 console.log("");
 
@@ -220,9 +306,9 @@ try {
     await inst.cdp.send("Runtime.enable");
     await inst.cdp.send("Page.enable");
 
-    const url = MODE === "room"
-      ? `${BASE}/index.html${pageQuery}`
-      : `${BASE}/index.html?probe=1&name=${inst.name}`;
+    const url = MODE === "probe"
+      ? `${BASE}/index.html?probe=1&name=${inst.name}`
+      : `${BASE}/index.html${pageQuery}`;
     console.log(`  ${inst.name} → ${url}`);
     await inst.cdp.send("Page.navigate", { url });
   }
@@ -230,12 +316,14 @@ try {
 
   if (MODE === "room") {
     await checkRoom();
+  } else if (MODE === "walk") {
+    await checkWalk();
   } else {
     await checkProbe();
   }
 
   for (const inst of instances) {
-    const pat = MODE === "room" ? "[net]" : "[netprobe]";
+    const pat = MODE === "probe" ? "[netprobe]" : "[net]";
     const lines = inst.cdp.console.filter((l) => l.startsWith(pat));
     if (lines.length) {
       console.log(`  ${inst.name} 日志（末 4 条）:`);
@@ -244,13 +332,136 @@ try {
     }
   }
 } finally {
-  for (const child of running) kill(child);
+  await releasePointerLock();   // 先交还指针锁
+  await stopInstances();        // 优雅关闭，失败才强杀
+  clearClipCursor();            // 兜底清一次系统裁剪
   for (const inst of instances) inst.cdp?.close();
-  await sleep(500);
   try {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   } catch {
     console.log(`  （临时目录没删掉，可手动清理: ${tmpRoot}）`);
+  }
+}
+
+/** 读一次页面里的联机状态快照。 */
+async function readStat(cdp) {
+  const raw = await cdp.evaluate("JSON.stringify(window.__netstat || null)");
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // 正在写入的时刻读到半个 JSON，下一次再读
+    return null;
+  }
+}
+
+/**
+ * 走路模式：注入真实的鼠标点击与键盘事件，读取火柴人的关节角度与自身位置。
+ *
+ * 这是本文件里唯一能证明"骨骼动画真的在跑"的检查：前面的自检只验证了角度计算公式，
+ * 这里走的是完整链路（浏览器输入 → Godot 输入映射 → 物理移动 → 关节角度 → 画面）。
+ */
+async function checkWalk() {
+  const cdp = instances[0].cdp;
+
+  // 无头 Chrome 默认不给页面前台焦点，此时指针锁会失败（WrongDocumentError），
+  // 而键盘又只在指针锁定时生效，所以焦点是这一步的前提。
+  await cdp.send("Page.bringToFront");
+  await sleep(700);
+  const hasFocus = await cdp.evaluate("document.hasFocus()");
+  console.log(`  页面焦点: ${hasFocus}`);
+  if (!hasFocus) {
+    console.log("  页面拿不到前台焦点，指针锁必然失败，无法测键盘输入。");
+    process.exitCode = 1;
+    return;
+  }
+
+  let state = null;
+  const readyDeadline = Date.now() + 30_000;
+  while (Date.now() < readyDeadline) {
+    state = await readStat(cdp);
+    if (state?.connected) break;
+    await sleep(300);
+  }
+  if (!state?.connected) {
+    console.log("  联机没就绪，无法测走路。");
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`  已连接 编号=${state.myId} 样式=${state.myStyle}`);
+
+  // 出生点在 y=1 的空中，落地前用的是空中姿势，先等它落地。
+  await sleep(1500);
+
+  // 点击画面 = 请求全屏 + 接管鼠标（由注入脚本串起来）。键盘只在锁定后生效。
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+
+  let locked = false;
+  for (let i = 0; i < 25; i++) {
+    locked = await cdp.evaluate("!!document.pointerLockElement");
+    if (locked) break;
+    await sleep(200);
+  }
+  if (locked) usedPointerLock = true;   // 收尾时要用到：先释放再强杀
+  console.log(`  指针锁定: ${locked}`);
+
+  // 静置采样：用来确认"没走路时腿是直的"，否则摆幅数据没有对照。
+  const idleLegs = [];
+  for (let i = 0; i < 6; i++) {
+    const s = await readStat(cdp);
+    if (s?.figure) idleLegs.push(Math.abs(s.figure.legAngle));
+    await sleep(70);
+  }
+  const idleMax = idleLegs.length ? Math.max(...idleLegs) : 0;
+
+  // W 键对应 Godot 的 move_forward。Godot 网页版按 event.code 匹配物理键位。
+  const KEY_W = { windowsVirtualKeyCode: 87, nativeVirtualKeyCode: 87, code: "KeyW", key: "w" };
+  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...KEY_W });
+
+  const startPos = (await readStat(cdp))?.pos ?? null;
+  const walkLegs = [];
+  const walkArms = [];
+  for (let i = 0; i < 44; i++) {
+    const s = await readStat(cdp);
+    if (s?.figure) {
+      walkLegs.push(s.figure.legAngle);
+      walkArms.push(s.figure.armAngle);
+    }
+    await sleep(50);
+  }
+  const endPos = (await readStat(cdp))?.pos ?? null;
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...KEY_W });
+
+  const legRange = walkLegs.length ? Math.max(...walkLegs) - Math.min(...walkLegs) : 0;
+  const armRange = walkArms.length ? Math.max(...walkArms) - Math.min(...walkArms) : 0;
+  const moved = startPos && endPos
+    ? Math.hypot(endPos[0] - startPos[0], endPos[2] - startPos[2])
+    : 0;
+
+  console.log("");
+  const results = [
+    ["点击画面后指针被锁定", locked, "键盘只在锁定后生效"],
+    ["静置时腿是直的", idleMax < 0.1, `最大 |角度| = ${idleMax.toFixed(3)} 弧度`],
+    ["走动时腿在前后摆", legRange > 0.6, `摆幅 ${legRange.toFixed(2)} 弧度`],
+    ["走动时手臂在反相摆", armRange > 0.3, `摆幅 ${armRange.toFixed(2)} 弧度`],
+    ["按住 W 时角色确实移动了", moved > 1.0, `水平位移 ${moved.toFixed(2)} 米`],
+  ];
+
+  console.log("  结论:");
+  for (const [label, ok, detail] of results) {
+    console.log(`  ${ok ? "✓" : "✗"} ${label} — ${detail}`);
+  }
+  console.log("");
+  if (results.some(([, ok]) => !ok)) {
+    process.exitCode = 1;
+    console.log("  控制台输出：");
+    for (const line of cdp.console.slice(-25)) console.log(`    ${line}`);
+    for (const line of cdp.exceptions.slice(-5)) console.log(`    EXCEPTION ${line}`);
   }
 }
 
@@ -305,6 +516,8 @@ async function checkRoom() {
   console.log(JSON.stringify(state, null, 2));
   console.log("");
 
+  // 两个实例是同时启动的，谁先连上不确定，所以只要求是 0 与 1 各一个。
+  const ranks = [a.myRank, b.myRank].sort();
   const results = [
     ["两个客户端都进入已连接状态", a.connected && b.connected,
       `alpha ${a.status} / beta ${b.status}`],
@@ -313,6 +526,12 @@ async function checkRoom() {
       `alpha 看到 ${JSON.stringify(a.peers)} / beta 看到 ${JSON.stringify(b.peers)}`],
     ["各自为对方建了替身", a.avatars >= 1 && b.avatars >= 1,
       `alpha 替身 ${a.avatars} / beta 替身 ${b.avatars}`],
+    ["按进入顺序分到 0 号与 1 号样式", ranks[0] === 0 && ranks[1] === 1,
+      `alpha rank=${a.myRank}(${a.myStyle}) / beta rank=${b.myRank}(${b.myStyle})`],
+    ["两人样式不同", a.myStyle !== b.myStyle, `${a.myStyle} / ${b.myStyle}`],
+    ["替身样式与对方的进入顺序一致",
+      a.peerRanks[String(b.myId)] === b.myRank && b.peerRanks[String(a.myId)] === a.myRank,
+      `alpha 眼中 beta=${a.peerRanks[String(b.myId)]} / beta 眼中 alpha=${b.peerRanks[String(a.myId)]}`],
   ];
 
   console.log("  结论:");
