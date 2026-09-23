@@ -96,6 +96,7 @@ node tools/net-probe-check.mjs https://127.0.0.1:8001 --room
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --walk
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --shoot
 node tools/net-probe-check.mjs https://127.0.0.1:8001 --score   # 记分/判胜负/下一回合（?kills=1）
+node tools/net-probe-check.mjs https://127.0.0.1:8001 --fire    # 开火扳机（复现被吞掉的 mouseup）
 ```
 
 `NET_SHOT_DIR=<目录>` 会把每个实例的画面存下来（含开火中整屏 + 准星放大），
@@ -186,6 +187,17 @@ CDP 测试的两个坑：
   锁定状态，所以 `player.gd` 对 web 平台**刻意不动** `mouse_mode`（桌面端照旧由引擎锁）。
 - **滚轮也是 `InputEventMouseButton`**（`button_index` 是 4/5）且 `pressed` 为 true。
   判断"用户要开始玩"必须校验 `button_index == MOUSE_BUTTON_LEFT`，否则滚一下滚轮就进游戏。
+- **浏览器会把“点击进游戏”那次的 mouseup 吞掉（Mac 触控板 + 全屏过渡实测）。**
+  Godot 的动作状态只由事件驱动，于是 `Input.is_action_pressed("fire")` 永远停在“按下”→
+  一直开火。现在开火扳机（`player._trigger_held`）自己维护：
+  **只有已经接管鼠标之后的左键按下才算按住**，接管/交还鼠标、失焦、松开都算松开。
+  局中丢失松开则由**浏览器侧**的两个计数救回（`export_presets.cfg` 的 head_include
+  维护 `__fireDown/__fireUp`，并在 pointermove 里用 `e.buttons` 自我纠正）。
+- **不要用“移动事件的按键掩码为 0”当松开信号**：实测 Godot 网页版把移动事件的掩码
+  填成**它自己**记录的状态，而不是浏览器的 `e.buttons`，丢了 mouseup 时它一直是 1，
+  这条启发式永远不会触发（`--fire` 的第 6 项就是量它的）。
+- **`Input.action_release` 能清掉“设备驱动”的动作状态**（实测：`mousePressed` 后又
+  调它，`is_action_pressed` 变 false），所以接管鼠标时顺手清一次也有效。
 - **键盘只在鼠标锁定时生效**，判据是 `Input.mouse_mode == MOUSE_MODE_CAPTURED`。
   另外切标签页会丢 `keyup` 让按键卡住，`_notification()` 里监听
   `NOTIFICATION_APPLICATION_FOCUS_OUT` 主动清。

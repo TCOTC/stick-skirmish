@@ -40,11 +40,13 @@ const MODE = ARG === "--room" ? "room"
   : ARG === "--walk" ? "walk"
   : ARG === "--shoot" ? "shoot"
   : ARG === "--score" ? "score"
+  : ARG === "--fire" ? "fire"
   : "probe";
 const ROOM_NAME = process.env.TEST_ROOM ?? "roomtest";
 const WALK_ROOM = process.env.WALK_ROOM ?? "walktest";
 const SHOOT_ROOM = process.env.SHOOT_ROOM ?? "shoottest";
 const SCORE_ROOM = process.env.SCORE_ROOM ?? "scoretest";
+const FIRE_ROOM = process.env.FIRE_ROOM ?? "firetest";
 const SHOT_DIR = process.env.NET_SHOT_DIR ?? "";
 // 让第二个实例晚一点再加入，用来复现"一个人先开、另一个人后进"的真实场景。
 //
@@ -529,8 +531,8 @@ async function waitFor(fn, timeoutMs, stepMs = 250) {
   return last;
 }
 
-// 走路模式只需要一个实例，而且不能有别的客户端：位置变化要来自真实的键盘输入。
-const instances = MODE === "walk"
+// 走路与开火模式只需要一个实例：二者都是“只看自己的输入”，不需要对手。
+const instances = (MODE === "walk" || MODE === "fire")
   ? [{ key: "a", name: "alpha", port: DEBUG_PORT }]
   : [
     { key: "a", name: "alpha", port: DEBUG_PORT },
@@ -546,6 +548,7 @@ const PAGE_QUERY = {
   walk: `?room=${encodeURIComponent(WALK_ROOM)}`,
   shoot: `?room=${encodeURIComponent(SHOOT_ROOM)}&kills=99`,
   score: `?room=${encodeURIComponent(SCORE_ROOM)}&kills=1`,
+  fire: `?room=${encodeURIComponent(FIRE_ROOM)}&kills=99`,
 };
 const pageQuery = PAGE_QUERY[MODE] ?? null;
 
@@ -553,7 +556,8 @@ const MODE_LABEL = {
   room: `房间联机（room=${ROOM_NAME}）`,
   walk: `走路动画（room=${WALK_ROOM}）`,
   shoot: `射击命中（room=${SHOOT_ROOM}）`,
-  score: `记分与回合（room=${SCORE_ROOM}，${1} 杀定胜负）`,
+  score: `记分与回合（room=${SCORE_ROOM}，1 杀定胜负）`,
+  fire: `开火扳机（room=${FIRE_ROOM}，复现被吞掉的 mouseup）`,
   probe: "传输层探针",
 }[MODE];
 
@@ -615,6 +619,8 @@ try {
     await checkShoot();
   } else if (MODE === "score") {
     await checkScore();
+  } else if (MODE === "fire") {
+    await checkFire();
   } else {
     await checkProbe();
   }
@@ -1269,6 +1275,146 @@ async function checkScore() {
       for (const line of inst.cdp.console.slice(-20)) console.log(`    ${line}`);
       for (const line of inst.cdp.exceptions.slice(-5)) console.log(`    EXCEPTION ${line}`);
     }
+  }
+}
+
+/**
+ * 开火扳机模式：验证“浏览器吞掉 mouseup”不会让角色一直开火。
+ *
+ * 【为什么要单独测】Mac 触控板上有一个稳定可重现的故障：点一下进入游戏之后就一直开火，
+ * 即使早已松开。成因是那次点击触发了全屏 + 指针锁定，而**松开事件被吞掉了**——
+ * Godot 的动作状态只由事件驱动，丢了 mouseup 就永远停在“按下”。
+ *
+ * 从 Windows 无法重现 Mac 上那次事件丢失，但可以用 CDP 造出**同样的局面**：
+ * 发一个 `mousePressed`、**永远不发 `mouseReleased`**。这就是本模式的第一项断言。
+ *
+ * 四项断言，各自守一件事：
+ *   1. 进游戏那一下（松开被吞）不会开火 —— 直接对应报障的那个症状
+ *   2. 按住时移动鼠标仍在开火 —— 给“移动掩码”那个兜底上保险，它不能把真按住当成松开
+ *   3. 正常点一下能打出一发，松手后停下 —— 不能为了修故障把点射弄坏
+ *   4. 局中丢掉松开事件时，之后的鼠标移动能把它救回来 —— 兜底路径真的有效
+ */
+async function checkFire() {
+  const cdp = instances[0].cdp;
+
+  await cdp.send("Page.bringToFront");
+  await sleep(700);
+  const hasFocus = await cdp.evaluate("document.hasFocus()");
+  console.log(`  页面焦点: ${hasFocus}`);
+  if (!hasFocus) {
+    console.log("  页面拿不到前台焦点，指针锁必然失败，无法测输入。");
+    process.exitCode = 1;
+    return;
+  }
+
+  const ready = await waitFor(async () => {
+    const s = await readStat(cdp);
+    return s?.connected && s.trigger ? s : null;
+  }, 30_000);
+  if (!ready) {
+    console.log("  游戏没就绪（拿不到 trigger 字段？）");
+    process.exitCode = 1;
+    return;
+  }
+
+  /** 发一个左键按下，**不发松开**。 */
+  const pressOnly = (buttons = 1) => cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1, buttons,
+  });
+  /** 只发移动，`buttons` 就是浏览器认为当前按着哪些键。 */
+  const move = (x, buttons) => cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseMoved", x, y: 360, buttons,
+  });
+
+  // --- 1. 进入游戏：按下之后永不松开（复现被吞掉的 mouseup）---
+  await pressOnly();
+  const locked = await waitFor(
+    async () => (await cdp.evaluate("!!document.pointerLockElement")) || null, 6000, 200,
+  );
+  if (locked) usedPointerLock = true;
+  console.log(`  指针锁定: ${locked}`);
+  // 等过 FIRE_BLOCK_AFTER_CAPTURE（0.25 秒）再加上足够长的时间，让“一直开火”暴露出来
+  await sleep(1800);
+  const afterEnter = await readStat(cdp);
+  const enterShots = afterEnter?.shots ?? -1;
+  const enterRaw = afterEnter?.trigger?.raw ?? null;
+
+  // --- 2. 按住时移动鼠标：必须继续开火 ---
+  // 这一项是给“移动掩码为 0 就算松开”那条兜底上保险的：如果 Godot 在网页版里
+  // 永远把移动事件的按键掩码填 0，那条兜底会在玩家边走边打时把扳机掐掉。
+  await pressOnly();
+  const holdStart = await waitFor(async () => {
+    const s = await readStat(cdp);
+    return (s?.shots ?? 0) > enterShots ? s : null;
+  }, 3000, 100);
+  const holdShots = holdStart?.shots ?? 0;
+  for (let i = 0; i < 8; i++) {
+    await move(420 + i * 24, 1);
+    await sleep(70);
+  }
+  const whileMoving = await readStat(cdp);
+  const movingShots = whileMoving?.shots ?? 0;
+  await cdpFire(cdp, false);
+  await sleep(500);
+  const releasedShots = (await readStat(cdp))?.shots ?? 0;
+  await sleep(500);
+  const stillShots = (await readStat(cdp))?.shots ?? 0;
+
+  // --- 3. 正常点一下：应当打出一发，然后不再增长 ---
+  await cdpFire(cdp, true);
+  await sleep(140);
+  await cdpFire(cdp, false);
+  await sleep(400);
+  const tapShots = (await readStat(cdp))?.shots ?? 0;
+  const tapDelta = tapShots - stillShots;
+  await sleep(600);
+  const tapIdle = (await readStat(cdp))?.shots ?? 0;
+
+  // --- 4. 局中丢掉松开事件：靠之后的移动救回来 ---
+  await pressOnly();
+  const stuck = await waitFor(async () => {
+    const s = await readStat(cdp);
+    return (s?.shots ?? 0) > tapIdle && s?.trigger?.held === true ? s : null;
+  }, 3000, 100);
+  const stuckHeld = stuck?.trigger?.held ?? false;
+  const stuckShots = stuck?.shots ?? 0;
+  // 手指在触控板上移动：浏览器知道按钮已经抬起，所以 buttons = 0
+  for (let i = 0; i < 4; i++) {
+    await move(520 + i * 20, 0);
+    await sleep(70);
+  }
+  await sleep(500);
+  const recovered = await readStat(cdp);
+  const recoveredHeld = recovered?.trigger?.held ?? null;
+  const recoveredShots = recovered?.shots ?? 0;
+  await sleep(700);
+  const settledShots = (await readStat(cdp))?.shots ?? 0;
+
+  console.log("");
+  const results = [
+    ["进游戏那一下（松开被吞掉）不开火", enterShots === 0,
+      `已开火 ${enterShots} 发；Godot 自己的动作状态 raw=${enterRaw}`],
+    ["按住时移动鼠标仍然在开火", movingShots > holdShots,
+      `${holdShots} 发 → 移动 8 次之后 ${movingShots} 发`],
+    ["松手之后不再继续开火", stillShots - releasedShots <= 1,
+      `松手后 500 毫秒内多打了 ${stillShots - releasedShots} 发`],
+    ["点一下能打出一发（没把点射修坏）", tapDelta >= 1 && tapIdle - tapShots <= 1,
+      `点一下打出 ${tapDelta} 发，之后再等 600 毫秒又多 ${tapIdle - tapShots} 发`],
+    ["局中丢掉松开事件时确实在开火（构造成功）", stuckHeld,
+      `扳机 held=${stuckHeld}，已开火 ${stuckShots} 发`],
+    ["之后的鼠标移动把扳机救回来", recoveredHeld === false && settledShots - recoveredShots <= 1,
+      `移动后 held=${recoveredHeld}，再等 700 毫秒多打 ${settledShots - recoveredShots} 发`],
+  ];
+  console.log("  结论:");
+  for (const [label, ok, detail] of results) {
+    console.log(`  ${ok ? "✓" : "✗"} ${label} — ${detail}`);
+  }
+  console.log("");
+  if (results.some(([, ok]) => !ok)) {
+    process.exitCode = 1;
+    console.log(`  --- ${instances[0].name} 控制台 ---`);
+    for (const line of cdp.console.slice(-20)) console.log(`    ${line}`);
+    for (const line of cdp.exceptions.slice(-5)) console.log(`    EXCEPTION ${line}`);
   }
 }
 

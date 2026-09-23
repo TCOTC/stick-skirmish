@@ -561,6 +561,7 @@ func _publish() -> void:
 		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
 		"health": own_health,
 		"shots": shots,
+		"trigger": _trigger_info(),
 		"recoilDeg": pitch_deg,
 		"crouch": crouch,
 		"pitchDeg": pitch_deg,
@@ -580,6 +581,17 @@ func _publish() -> void:
 		"hud": _hud_info(),
 	}
 	JavaScriptBridge.eval("window.__netstat = " + JSON.stringify(snapshot))
+
+
+## 开火扳机的状态（player 自己维护的那份，见 `player._trigger_held`）。
+##
+## 单独报出来是因为“浏览器吞掉 mouseup”是一个真实存在的故障（Mac 触控板：点一下进游戏
+## 就一直开火）。那种情况下 `raw`（Godot 自己的动作状态，只由事件驱动）会永远停在 true，
+## 所以自动化检查要能断言“即使 raw 卡住，`held` 也已经回到 false 且不再开火”。
+func _trigger_info() -> Dictionary:
+	if _player != null and _player.has_method("trigger_state"):
+		return _player.call("trigger_state")
+	return {"held": false, "pulse": 0.0, "raw": false}
 
 
 ## 编号 → 名字，供自动化检查核对两端对同一个人的称呼是否一致。

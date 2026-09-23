@@ -81,6 +81,11 @@ extends CharacterBody3D
 ## 刚接管鼠标后这段时间内不开火：那一次点击是用来锁定指针的，不该顺手打出一发。
 const FIRE_BLOCK_AFTER_CAPTURE := 0.25
 
+## “点了一下”这一发最多保留多久（秒）。
+## 极短的点击可能在同一帧里完成按下与松开，那时 `_trigger_held` 已经回到 false，
+## 但这一下仍应打出一发，所以单独留一个脉冲。
+const TRIGGER_PULSE_TIME := 0.15
+
 ## 默认/开局俯仰（弧度）。回合重置时回到这里。
 const START_PITCH := -0.22
 
@@ -118,6 +123,23 @@ var shots_fired := 0
 var _spawn_pos := Vector3.ZERO
 var _spawn_yaw := 0.0
 var _spawn_known := false
+
+## 开火扳机的状态。**自己维护**，不直接读 `Input.is_action_pressed("fire")`。
+##
+## 【为什么】Godot 的动作状态只由事件驱动，而浏览器在“进入全屏 + 指针锁定”的那一次点击上
+## **可能丢掉 mouseup**（Mac 触控板上实测：点一下进游戏，随后就一直开火）。
+## 丢了松开事件，动作状态就永远停在“按下”，每帧都判定为按住不放。
+## 从 Windows 无法直接重现 Mac 的那次事件丢失，但可以用 CDP 造出同样的局面：
+## 发一个 mousePressed、**永远不发 mouseReleased**（见 `net-probe-check.mjs --fire`）。
+##
+## 自己维护之后规则很简单，而且不怕丢事件：
+##   - 只有**已经接管鼠标之后**收到的左键按下才算“按住”→ 进游戏那一下永远不会开火
+##   - 接管鼠标的那一刻、丢失指针、窗口失焦、左键松开，都算“松开”
+##   - 指针移动事件里带着“当前按下了哪些键”的掩码，掩码为 0 也算“松开”
+##     （触控板几乎总会有移动，所以这条能救“局中丢掉松开事件”的情况）
+var _trigger_held := false
+## “点了一下”产生的那一发还剩多久（秒）。
+var _trigger_pulse := 0.0
 # 当前的散布半径（度）。跟着连发增长、停火回落。
 var _spread := 0.0
 # 已经推给 HUD 的散布值，用来避免每帧都去查 HUD。
@@ -165,20 +187,30 @@ func _unhandled_input(event: InputEvent) -> void:
 			deg_to_rad(pitch_max_deg)
 		)
 		_arm.rotation.x = _pitch
-	elif event is InputEventMouseButton and event.pressed:
+		# 注意：**不要**用“移动事件的按键掩码为 0”当松开信号。
+		# 实测（tools/net-probe-check.mjs --fire 的第 6 项）Godot 网页版把移动事件的掩码
+		# 填成**它自己**记录的状态，而不是浏览器的 `e.buttons`；所以丢了 mouseup 时
+		# 掩码会一直为 1，这条启发式永远不触发（看起来像兜底，实际是死代码）。
+		# 真正独立的信息源在浏览器那边，见 `_dom_trigger_released()`。
+	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		# 只认左键：滚轮也会产生 InputEventMouseButton（button_index 是 WHEEL_*），
-		# 但"滚一下滚轮"不该等于"我要开始玩"。
-		if event.button_index != MOUSE_BUTTON_LEFT:
-			return
-		# 网页上"锁指针"这一步交给注入的脚本做，这里刻意不碰。
-		# 原因：requestFullscreen 和 requestPointerLock 都由浏览器要求"必须在用户手势里发出"，
-		# 两者同时发出会打架 —— 全屏切换过程中发出的锁定请求偶尔被拒，
-		# 表现就是"全屏进去了、鼠标还显示着，得再点一次"。
-		# 脚本里把两者串成"先全屏 → 等切换完成 → 再锁"，并带两次重试；
-		# Godot 会自己跟随浏览器真实的指针锁状态，不需要引擎再发一次请求。
-		# 桌面端没有全屏这回事，照旧由引擎自己锁。
-		if not OS.has_feature("web") and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
-			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		# 而"滚一下滚轮"不该等于"我要开始玩"也不该等于"开火"。
+		if event.pressed:
+			# **只有已经接管鼠标之后的按下才算开火**（见 _trigger_held 的注释）。
+			if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+				_trigger_held = true
+				_trigger_pulse = TRIGGER_PULSE_TIME
+			# 网页上"锁指针"这一步交给注入的脚本做，这里刻意不碰。
+			# 原因：requestFullscreen 和 requestPointerLock 都由浏览器要求"必须在用户手势里发出"，
+			# 两者同时发出会打架——全屏切换过程中发出的锁定请求偶尔被拒，
+			# 表现就是"全屏进去了、鼠标还显示着，得再点一次"。
+			# 脚本里把两者串成"先全屏 → 等切换完成 → 再锁"，并带两次重试；
+			# Godot 会自己跟随浏览器真实的指针锁状态，不需要引擎再发一次请求。
+			# 桌面端没有全屏这回事，照旧由引擎自己锁。
+			elif not OS.has_feature("web"):
+				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+		else:
+			_release_trigger()
 	elif event.is_action_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 
@@ -192,6 +224,8 @@ func _physics_process(delta: float) -> void:
 			_fire_block = FIRE_BLOCK_AFTER_CAPTURE
 		else:
 			_stop_moving()
+		# 接管/交还鼠标都算“松开”：进游戏那次点击即使丢了松开事件，也不会一直开火。
+		_release_trigger()
 		# 让 HUD 收起/显示“点一下画面”的提示。没人告诉它的话，
 		# 第一次打开链接的人只会看到一个不会动的场地（浏览器不允许程序自己抢鼠标）。
 		var hud := _hud()
@@ -200,6 +234,11 @@ func _physics_process(delta: float) -> void:
 
 	_fire_cd = maxf(0.0, _fire_cd - delta)
 	_fire_block = maxf(0.0, _fire_block - delta)
+	_trigger_pulse = maxf(0.0, _trigger_pulse - delta)
+	# 兜底：我们以为在按住，但**浏览器**说左键已经抬起了（那次 mouseup 被吞掉）。
+	# 不查这个的话会一直开火——Mac 触控板上报障的就是这个现象。
+	if _trigger_held and active and _dom_trigger_released():
+		_release_trigger()
 	# 散布回落。与生死无关，所以放在存活判断之前。
 	_spread = maxf(spread_min_deg, _spread - spread_recover_per_sec * delta)
 	_shake = maxf(0.0, _shake - shake_recover * delta)
@@ -247,8 +286,12 @@ func _physics_process(delta: float) -> void:
 			Vector2(velocity.x, velocity.z).length(), is_on_floor(), delta, _crouch
 		)
 
-	if active and _fire_block <= 0.0 and Input.is_action_pressed("fire"):
-		_try_fire()
+	# 开火：扳机是**自己维护**的状态（见 _trigger_held）。
+	# 两个来源：按住，以及“点了一下”的脉冲（极短的点击可能在同一帧里按下又松开）。
+	if active and _fire_block <= 0.0 and (_trigger_held or _trigger_pulse > 0.0):
+		# 脉冲只在真的打出一发之后才收掉：被射速冷却挡下时要留着，否则这一下就丢了。
+		if _try_fire() and not _trigger_held:
+			_trigger_pulse = 0.0
 
 
 ## 站立↔下蹲的过渡。下蹲只改相机高度与移动速度，碰撞胶囊高度不变——
@@ -382,12 +425,14 @@ func aim_direction() -> Vector3:
 	return (point - aim_origin()).normalized()
 
 
-func _try_fire() -> void:
+## 打一发。返回**是否真的打出去了**（受射速冷却限制）。
+## 调用方要用它的返回值决定要不要收掉“点了一下”的脉冲。
+func _try_fire() -> bool:
 	# 冷却判断放在这里而不是调用处：只有一个入口，其他地方想加“顺手开一枪”也绕不过射速。
 	if not alive or figure == null or figure.gun == null:
-		return
+		return false
 	if _fire_cd > 0.0:
-		return
+		return false
 	_fire_cd = fire_rate
 	shots_fired += 1
 
@@ -436,6 +481,7 @@ func _try_fire() -> void:
 	# 这一发已经让散布变大了，准星要**同一帧**跟上：放到下一帧再推的话，
 	# 显示的间距会永远比真实散布少一发，看起来像准星没跟上。
 	_push_spread()
+	return true
 
 
 ## 在方向周围取一个随机偏移，偏角最大为当前散布半径。
@@ -604,11 +650,53 @@ func _notification(what: int) -> void:
 		_stop_moving()
 
 
+## 清掉扳机。接管/交还鼠标、失焦、松开左键、移动事件里掩码为 0，都走这里。
+##
+## 同时把 Godot 自己那份动作状态也放掉：它只由事件驱动，丢了松开事件时会一直停在“按下”。
+## 那个状态现在不参与开火判定（我们读自己的 _trigger_held），但 `ui_*` 之类的地方
+## 仍然会受它影响，所以一并清干净。
+func _release_trigger() -> void:
+	_trigger_held = false
+	_trigger_pulse = 0.0
+	Input.action_release("fire")
+
+
+## 问浏览器：左键现在是不是还被按着。**独立于 Godot 自己的事件流**。
+##
+## 为什么需要它：浏览器会把“点击进入游戏”那次的 mouseup 吞掉（Mac 触控板 + 全屏过渡），
+## Godot 的动作状态只由事件驱动，于是永远停在“按下”而每帧开火。光靠 Godot 的事件
+## 发现不了这件事（移动事件的按键掩码也是它自己填的）。
+## 注入脚本（export_presets.cfg 的 head_include）因此维护了两个计数：左键按下与抬起各一个，
+## 并且会在移动事件里用浏览器的 `e.buttons` 自我纠正（即使 mouseup 丢了，
+## 下一次移动也能把“其实已经抬起”告诉页面）。这里读的就是这两个计数。
+##
+## 只在“我们自己认为按住”时才调用（每帧一次 JavaScriptBridge.eval，开销可忽略）。
+## 若注入脚本不存在（旧的导出产物），表达式返回 1，即“仍按着”——退回到原有行为，不会误报。
+func _dom_trigger_released() -> bool:
+	if not OS.has_feature("web"):
+		return false
+	var delta := int(JavaScriptBridge.eval(
+		"typeof window.__fireDown==='number' ? (window.__fireDown-window.__fireUp) : 1"
+	))
+	return delta <= 0
+
+
+## 供自动化检查读取：自己维护的扳机状态与 Godot 自己那份的对照。
+## `raw` 在“丢了松开事件”时会一直为 true，而 `held` 会正确回到 false（见 --fire 模式）。
+func trigger_state() -> Dictionary:
+	return {
+		"held": _trigger_held,
+		"pulse": snappedf(_trigger_pulse, 0.01),
+		"raw": Input.is_action_pressed("fire"),
+	}
+
+
 func _stop_moving() -> void:
 	velocity.x = 0.0
 	velocity.z = 0.0
 	for action in MOVE_ACTIONS:
 		Input.action_release(action)
+	_release_trigger()
 
 
 static func _ensure_actions() -> void:
