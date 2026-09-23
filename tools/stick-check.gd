@@ -12,6 +12,16 @@ var _failures: Array[String] = []
 var _fig: Node = null
 var _checks_done := false
 
+const HealthBarScript := preload("res://scripts/health_bar_3d.gd")
+
+# 枪口朝向的检查要**跨帧**做：骨骼附件的变换在帧内的内部处理里更新，
+# 设完姿势立即读会拿到上一帧的值。所以排队一组（偏身、俯仰）组合，一帧测一个。
+var _aim_queue: Array = []
+var _aim_now := Vector2.ZERO
+var _aim_waiting := false
+var _gun_worst := 0.0
+var _gun_details: Array[String] = []
+
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存，
 # 直接写 StickFigure 会报 "Could not find type"。
 const StickFigureScript := preload("res://scripts/stick_figure.gd")
@@ -248,14 +258,64 @@ func _initialize() -> void:
 	_fig = StickFigureScript.new()
 	root.add_child(_fig)
 	_fig.build()
+	# 枪要在 build 之后装备（配色取自样式材质）
+	_fig.equip_gun()
 
 
 func _process(_delta: float) -> bool:
-	if _checks_done:
+	if not _checks_done:
+		_checks_done = true
+		_run_checks()
+		_start_lean_checks()
 		return false
-	_checks_done = true
-	_run_checks()
+	if _aim_waiting:
+		_aim_waiting = false
+		_measure_muzzle(_aim_now)
+		_advance_lean()
 	return false
+
+
+## 逐个（偏身、俯仰）组合验证枪口方向。
+## 俯仰特意包含 0 与非 0：枪口必须跟着镜头俯仰，否则与子弹方向不一致。
+func _start_lean_checks() -> void:
+	_aim_queue = [
+		Vector2(0.0, 0.0), Vector2(0.5, 0.0), Vector2(-0.7, 0.0),
+		Vector2(0.0, -0.3), Vector2(0.78, -0.5), Vector2(-0.5, 0.25),
+	]
+	_advance_lean()
+
+
+func _advance_lean() -> void:
+	if _aim_queue.is_empty():
+		_check(_gun_worst < 2.0, "枪口始终对准子弹方向（不受偏身与俯仰影响）",
+			"最大偏差 %.1f°（%s）" % [_gun_worst, "、".join(_gun_details)])
+		_finish()
+		return
+	_aim_now = _aim_queue.pop_front()
+	_fig.rotation.y = _aim_now.x
+	_fig.aim_pitch = _aim_now.y
+	_fig.animate(4.0, true, 1.0 / 60.0)
+	_aim_waiting = true
+
+
+func _measure_muzzle(aim: Vector2) -> void:
+	var fwd: Vector3 = _fig.muzzle_forward()
+	# 期望方向：镜头在 Player 空间里绕 X 转了 aim_pitch，前方就是 (0, sin, -cos)。
+	# 角色自己的偏身与躯干前倾应当被手臂抵消掉，所以期望值与它们无关。
+	var expect := Vector3(0.0, sin(aim.y), -cos(aim.y))
+	var dot := clampf(fwd.dot(expect), -1.0, 1.0)
+	var deg := rad_to_deg(acos(dot))
+	_gun_worst = maxf(_gun_worst, deg)
+	_gun_details.append("偏身 %+.0f°/俯仰 %+.0f°→%.2f°" % [
+		rad_to_deg(aim.x), rad_to_deg(aim.y), deg])
+	# 枪口应当在身体前方（枪口指向 -Z，所以 z 更小）
+	if aim == Vector2.ZERO:
+		var muzzle: Vector3 = _fig.muzzle_position()
+		_check(
+			muzzle.z < _fig.global_position.z - 0.5,
+			"枪口在身体前方",
+			"枪口 z=%.2f、身体 z=%.2f" % [muzzle.z, _fig.global_position.z]
+		)
 
 
 func _run_checks() -> void:
@@ -391,6 +451,48 @@ func _run_checks() -> void:
 		"%.3f 弧度" % fig.bone_angle("upper_arm_l")
 	)
 
+	# --- 枪 ---
+	fig.apply_style(0)
+	fig.rotation.y = 0.0
+	fig.animate(0.0, true, 1.0 / 60.0)
+	_check(fig.gun != null, "已装备枪")
+
+	_check_health_bar()
+
+	# 重建外观不能把外部挂上来的子节点一起删掉。
+	# 联机侧的替身就是这样挂命中框与头顶血条的，曾经因为 _rebuild 全删子节点而被吞掉。
+	var marker := Node3D.new()
+	marker.name = "ForeignMarker"
+	fig.add_child(marker)
+	fig.apply_style(1)
+	_check(
+		fig.get_node_or_null("ForeignMarker") != null,
+		"换样式（重建外观）不会删掉外部挂上的子节点"
+	)
+	_check(
+		fig.get_node_or_null("Skeleton3D") != null,
+		"换样式后骨骼依然存在"
+	)
+	fig.apply_style(0)
+
+
+## 替身头顶的血条：这个类单独验一遍，因为它在联机侧是动态创建的，
+## 建失败时只表现为“画面里看不到”，很难定位。
+func _check_health_bar() -> void:
+	var bar = HealthBarScript.new()
+	root.add_child(bar)
+	bar.set_health(50, 100)
+	_check(bar.get_child_count() >= 2, "血条建出了底色与填充", "%d 个子节点" % bar.get_child_count())
+	_check(bar.position.y > 1.7, "血条在头顶上方", "y=%.2f" % bar.position.y)
+	bar.set_health(0, 100)
+	var full_bar = HealthBarScript.new()
+	root.add_child(full_bar)
+	full_bar.set_health(100, 100)
+	_check(full_bar.get_child_count() >= 2, "血条满血时也有底座", "%d 个子节点" % full_bar.get_child_count())
+
+
+## 收尾：汇总与退出。枪口朝向那几项是跨帧测的，所以不能写在 _run_checks 里。
+func _finish() -> void:
 	print("")
 	if _failures.is_empty():
 		print("  全部通过")

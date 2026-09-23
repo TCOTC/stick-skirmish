@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 /**
- * 用 CDP 驱动真实 Chrome 实例，验证联机链路。三个模式：
+ * 用 CDP 驱动真实 Chrome 实例，验证联机链路。四个模式：
  *
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001]            # 传输层探针
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --room     # 双方能不能看见对方
  *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --walk     # 走路时关节有没有在动
+ *   node tools/net-probe-check.mjs [https://127.0.0.1:8001] --shoot    # 能否打中对方并扣血
  *
  * 探针模式跑 scripts/net_probe.gd（需 ?probe=1），检查 wss 连接、中继转发、
  * Godot 高层 API 与广播 rpc；房间模式跑 scripts/net.gd，检查两个客户端进入同一房间后
  * 互相看到对方的替身与样式分配；走路模式注入真实的鼠标点击与键盘事件，
- * 读取火柴人的关节角度与自身位置，验证“走路时腿真的在摆、人真的在动”。
+ * 读取火柴人的关节角度与自身位置，验证“走路时腿真的在摆、人真的在动”；
+ * 射击模式把 alpha 转向 beta、开火，验证命中的判定与扣血真的发生在被打者身上。
+ *
+ * 环境变量：
+ *   NET_SHOT_DIR      每个实例收尾时把画面截图写到这个目录（用来人眼核对）
+ *   NET_CHECK_TIMEOUT_MS / TEST_ROOM / TEST_JOIN_DELAY_MS / WALK_ROOM / SHOOT_ROOM
  *
  * 前置：另开一个终端跑 node tools/serve.mjs。
  *
@@ -27,11 +33,19 @@ import { fileURLToPath } from "node:url";
 
 const BASE = (process.argv[2] ?? "https://127.0.0.1:8001").replace(/\/$/, "");
 const ARG = process.argv[3];
-const MODE = ARG === "--room" ? "room" : ARG === "--walk" ? "walk" : "probe";
+const MODE = ARG === "--room" ? "room"
+  : ARG === "--walk" ? "walk"
+  : ARG === "--shoot" ? "shoot"
+  : "probe";
 const ROOM_NAME = process.env.TEST_ROOM ?? "roomtest";
 const WALK_ROOM = process.env.WALK_ROOM ?? "walktest";
+const SHOOT_ROOM = process.env.SHOOT_ROOM ?? "shoottest";
+const SHOT_DIR = process.env.NET_SHOT_DIR ?? "";
 // 让第二个实例晚一点再加入，用来复现"一个人先开、另一个人后进"的真实场景。
 const JOIN_DELAY_MS = Number(process.env.TEST_JOIN_DELAY_MS ?? 0);
+
+// 鼠标横移用一个固定的 x 累加，好让 movementX 已知（见 mouseDelta）。
+let mouseX = 300;
 
 // Godot 的高层 rpc 会用节点路径缓存来省带宽；缓存靠连接时的握手机制建立。
 // 中继不参与握手，所以后加入者可能收不到先加入者早先发过的路径公告，
@@ -319,6 +333,44 @@ function angleDiff(a, b) {
   return ((a - b) % 360 + 540) % 360 - 180;
 }
 
+/**
+ * 相对横移鼠标。
+ *
+ * 注意：**合成的鼠标位移与 Godot 收到的移动量不成固定比例**——Windows 的指针加速
+ * 会对它做非线性映射，实测同一种位移在两次运行里得到 0.05 与 0.23 度/像素两种结果。
+ * 所以用它的检查只能断言“朝向确实变了”，不能拿它做定量转向。
+ */
+async function mouseDelta(cdp, px) {
+  const steps = Math.max(1, Math.round(Math.abs(px) / 40));
+  const each = px / steps;
+  for (let i = 0; i < steps; i++) {
+    mouseX += each;
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: Math.round(mouseX), y: 360, buttons: 0,
+    });
+    await sleep(40);
+  }
+  await sleep(300);
+}
+
+/** 替身的装饰件（命中框、血条）都还在。它们曾被外观重建一起删掉。 */
+function decorOk(state) {
+  const entries = Object.entries(state.avatarDecor ?? {});
+  return entries.length > 0 && entries.every(([, d]) => d.hitBox && d.barOk);
+}
+
+/** 轮询直到条件满足或超时。 */
+async function waitFor(fn, timeoutMs, stepMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await fn();
+    if (last) return last;
+    await sleep(stepMs);
+  }
+  return last;
+}
+
 // 走路模式只需要一个实例，而且不能有别的客户端：位置变化要来自真实的键盘输入。
 const instances = MODE === "walk"
   ? [{ key: "a", name: "alpha", port: DEBUG_PORT }]
@@ -331,11 +383,14 @@ const pageQuery = MODE === "room"
   ? `?room=${encodeURIComponent(ROOM_NAME)}`
   : MODE === "walk"
     ? `?room=${encodeURIComponent(WALK_ROOM)}`
-    : null;
+    : MODE === "shoot"
+      ? `?room=${encodeURIComponent(SHOOT_ROOM)}`
+      : null;
 
 const MODE_LABEL = {
   room: `房间联机（room=${ROOM_NAME}）`,
   walk: `走路动画（room=${WALK_ROOM}）`,
+  shoot: `射击命中（room=${SHOOT_ROOM}）`,
   probe: "传输层探针",
 }[MODE];
 
@@ -375,8 +430,21 @@ try {
     await checkRoom();
   } else if (MODE === "walk") {
     await checkWalk();
+  } else if (MODE === "shoot") {
+    await checkShoot();
   } else {
     await checkProbe();
+  }
+
+  // 可选：把每个实例的画面存下来，供人眼核对（特效、血条、枪的形状这类只能看）
+  if (SHOT_DIR) {
+    fs.mkdirSync(SHOT_DIR, { recursive: true });
+    for (const inst of instances) {
+      const res = await inst.cdp.send("Page.captureScreenshot", { format: "png" });
+      const file = path.join(SHOT_DIR, `${MODE}-${inst.name}.png`);
+      fs.writeFileSync(file, Buffer.from(res.data, "base64"));
+      console.log(`  截图已保存 ${file}`);
+    }
   }
 
   for (const inst of instances) {
@@ -387,8 +455,7 @@ try {
       for (const line of lines.slice(-4)) console.log(`    ${line}`);
       console.log("");
     }
-  }
-} finally {
+  }} finally {
   await releasePointerLock();   // 先交还指针锁
   await stopInstances();        // 优雅关闭，失败才强杀
   clearClipCursor();            // 兜底清一次系统裁剪
@@ -573,6 +640,173 @@ async function checkWalk() {
   }
 }
 
+/**
+ * 射击模式：让 alpha 真的把 beta 打中，验证扣血发生在被打者身上。
+ *
+ * 这条链路的每一段都必须真的跑起来才算过：鼠标转镜头 → 准星对准 → 开火 →
+ * 广播 → beta 用**自己的位置**判定命中 → 扣血并广播 → alpha 看到血条变化。
+ * 所以这里不注入任何“作弊”接口，全部走真实输入。
+ */
+async function checkShoot() {
+  const a = instances.find((i) => i.name === "alpha");
+  const b = instances.find((i) => i.name === "beta");
+
+  await a.cdp.send("Page.bringToFront");
+  await sleep(700);
+
+  // 等两边都就绪并有对方的替身
+  const ready = await waitFor(async () => {
+    const sa = await readStat(a.cdp);
+    const sb = await readStat(b.cdp);
+    if (sa?.connected && sb?.connected && sa.peers.length > 0 && sb.peers.length > 0) {
+      return { sa, sb };
+    }
+    return null;
+  }, 30_000);
+  if (!ready) {
+    console.log("  联机没就绪，无法测射击。");
+    process.exitCode = 1;
+    return;
+  }
+
+  // alpha 要转镜头就得接管鼠标（键盘与鼠标事件只在指针锁定后生效）
+  const locked = await clickToCapture(a.cdp);
+  if (locked) usedPointerLock = true;
+  console.log(`  指针锁定: ${locked}`);
+  await sleep(1200);   // 让“接管鼠标后短暂不开火”那段时间过去
+
+  // 点击画面那一下**不该**顺手打出一发：那次点击是用来锁定指针的。
+  // 这是最容易被玩家骂的细节之一，所以单独断言。
+  const shotsAfterCapture = (await readStat(a.cdp))?.shots ?? -1;
+
+  // 出生时两人就面对面（见 net.gd 的 _on_connected），所以不需要转镜头，
+  // 只要确认朝向确实指着对方，然后开火。
+  const fresh = await readStat(a.cdp);
+  const me = fresh.pos;
+  const peerId = String(fresh.peers[0]);
+  const them = fresh.peerPos[peerId];
+  const facingDeg = fresh.figure.bodyYawDeg;
+  const targetYaw = (Math.atan2(-(them[0] - me[0]), -(them[2] - me[2])) * 180) / Math.PI;
+  const aimErr = Math.abs(angleDiff(targetYaw, facingDeg));
+  console.log(`  alpha ${JSON.stringify(me)} → beta ${JSON.stringify(them)}`
+    + `，当前朝向 ${facingDeg.toFixed(1)}°，目标 ${targetYaw.toFixed(1)}°`);
+
+  // 开火：按住一段时间（射速约 9 发/秒）。
+  // 记时长是为了**反推射速**：主循环受帧率影响，但冷却按时间算，所以射速应当恒定。
+  const shotsBefore = (await readStat(a.cdp))?.shots ?? 0;
+  const fireStart = Date.now();
+  const fxSeen = [];
+  await a.cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+  for (let i = 0; i < 12; i++) {
+    const s = await readStat(a.cdp);
+    if (s) fxSeen.push(s.fx);
+    await sleep(60);
+  }
+  await a.cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
+  });
+  const fireMs = Date.now() - fireStart;
+
+  const afterFire = await readStat(a.cdp);
+  const shotsDelta = (afterFire?.shots ?? 0) - shotsBefore;
+  const fxMax = fxSeen.length ? Math.max(...fxSeen) : 0;
+  const ratePerSec = shotsDelta / Math.max(0.001, fireMs / 1000);
+
+  // 等 beta 身上的扣血（后台标签页会被节流，给足时间）
+  const hurt = await waitFor(async () => {
+    const s = await readStat(b.cdp);
+    return s && s.health < 100 ? s : null;
+  }, 10_000);
+  const betaHealth = hurt?.health ?? (await readStat(b.cdp))?.health ?? -1;
+
+  // 血量归零后应当自动重生回满血（重生延迟 3 秒，后台页要给足时间）
+  const revived = betaHealth <= 0
+    ? await waitFor(async () => {
+      const s = await readStat(b.cdp);
+      return s && s.health >= 100 ? s : null;
+    }, 15_000, 400)
+    : null;
+
+  // 特效应当自己清掉，不能越积越多
+  await sleep(1200);
+  const fxAfter = (await readStat(a.cdp))?.fx ?? -1;
+
+  // 再补两张开火中的截图（曳光只活 45 毫秒，得在持续开火时抓）。
+  // 一张整屏、一张对准星周围放大：枪、血条、命中提示这类细节整屏看不清。
+  //
+  // 拍之前先等对方重生回满血、再只打一小段：不然截图里对方是 0 血，
+  // 血条填充会隐藏，就验证不了“血条随血量变化”这件事。
+  if (SHOT_DIR) {
+    await waitFor(async () => {
+      const s = await readStat(b.cdp);
+      return s && s.health >= 100;
+    }, 15_000, 400);
+
+    await a.cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
+    });
+    await sleep(180);
+    fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+    const full = await a.cdp.send("Page.captureScreenshot", { format: "png" });
+    const fullFile = path.join(SHOT_DIR, "shoot-firing.png");
+    fs.writeFileSync(fullFile, Buffer.from(full.data, "base64"));
+    console.log(`  开火中截图 ${fullFile}`);
+
+    const vw = await a.cdp.evaluate("innerWidth");
+    const vh = await a.cdp.evaluate("innerHeight");
+    const cw = 150;
+    const ch = 120;
+    const zoom = await a.cdp.send("Page.captureScreenshot", {
+      format: "png",
+      clip: {
+        // 略高于屏幕中心：要盖上对方头顶的血条与自己的头
+        x: Math.round(vw / 2 - cw / 2), y: Math.round(vh / 2 - ch * 0.75),
+        width: cw, height: ch, scale: 5,
+      },
+    });
+    const zoomFile = path.join(SHOT_DIR, "shoot-firing-zoom.png");
+    fs.writeFileSync(zoomFile, Buffer.from(zoom.data, "base64"));
+    console.log(`  准星放大截图 ${zoomFile}`);
+
+    await a.cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
+    });
+  }
+
+  console.log("");
+  const results = [
+    ["指针被锁定（不然鼠标事件不生效）", locked, "点击画面后应进入指针锁定"],
+    ["出生朝向指着对方", aimErr < 5.0,
+      `当前 ${facingDeg.toFixed(1)}°、目标 ${targetYaw.toFixed(1)}°，差 ${aimErr.toFixed(1)}°`],
+    ["点击进入游戏的那一下不开火", shotsAfterCapture === 0,
+      `点击后已开火 ${shotsAfterCapture} 发`],
+    ["真的打出去了", shotsDelta > 0, `新增 ${shotsDelta} 发`],
+    ["射速受冷却限制（不是每帧一发）", ratePerSec > 3.0 && ratePerSec < 15.0,
+      `按住 ${fireMs} ms 打出 ${shotsDelta} 发，合 ${ratePerSec.toFixed(1)} 发/秒（配置 9）`],
+    ["开火产生了特效（曳光/弹着点）", fxMax > 0, `同时存在的特效最多 ${fxMax} 个`],
+    ["特效会自己清掉（不堆积）", fxAfter === 0, `1.2 秒后剩 ${fxAfter} 个`],
+    ["被打的人扣了血", betaHealth < 100, `beta 血量 ${betaHealth}`],
+    ["血量归零后重生回满血", betaHealth > 0 || revived !== null,
+      betaHealth > 0 ? `未打死（剩 ${betaHealth}）` : `重生后 ${revived?.health ?? "未恢复"}`],
+  ];
+  console.log("  结论:");
+  for (const [label, ok, detail] of results) {
+    console.log(`  ${ok ? "✓" : "✗"} ${label} — ${detail}`);
+  }
+  console.log("");
+  if (results.some(([, ok]) => !ok)) {
+    process.exitCode = 1;
+    for (const inst of instances) {
+      console.log(`  --- ${inst.name} 控制台 ---`);
+      for (const line of inst.cdp.console.slice(-20)) console.log(`    ${line}`);
+      for (const line of inst.cdp.exceptions.slice(-5)) console.log(`    EXCEPTION ${line}`);
+    }
+  }
+}
+
 /** 房间模式：两边都得连上，并且各自看到对方的编号与替身。 */
 async function checkRoom() {
   const state = {};
@@ -674,6 +908,9 @@ async function checkRoom() {
     ["替身样式与对方的进入顺序一致",
       a.peerRanks[String(b.myId)] === b.myRank && b.peerRanks[String(a.myId)] === a.myRank,
       `alpha 眼中 beta=${a.peerRanks[String(b.myId)]} / beta 眼中 alpha=${b.peerRanks[String(a.myId)]}`],
+    ["替身的命中框与头顶血条都还在", decorOk(a) && decorOk(b),
+      `alpha 眼中 beta=${JSON.stringify(a.avatarDecor[String(b.myId)])}`
+      + ` / beta 眼中 alpha=${JSON.stringify(b.avatarDecor[String(a.myId)])}`],
     ["鼠标转向后远端替身朝向跟随", mouseTurned && facingGap < 15,
       `本体朝向 ${selfFacing.toFixed(1)}°，远端替身 ${remoteFacing === null ? "无" : remoteFacing.toFixed(1) + "°"}（差 ${facingGap.toFixed(1)}°）`],
     ["接收过程没有 RPC 路径解析错误", rpcErrors === 0,
