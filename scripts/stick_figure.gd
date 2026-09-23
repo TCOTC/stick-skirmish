@@ -174,6 +174,17 @@ const GunScript := preload("res://scripts/gun.gd")
 ## 不带上它的话枪管会水平前伸，而子弹是沿带俯仰的镜头方向飞的，两者不一致。
 var aim_pitch := 0.0
 
+## 持枪姿态要**额外抵消**的偏身（弧度）。由 player.gd 每帧写入。
+##
+## 为什么不能直接用本节点的 `rotation.y`：那个量在不同宿主下含义不同，
+##   - 本地玩家：figure 挂在 Player 下，`rotation.y` 是相对 Player 的偏身，
+##     需要抵消（Player 的那份旋转在外层已经生效了，子弹方向就在 Player 空间里）
+##   - 替身：figure 直接挂在场景根下，`rotation.y` 是**世界朝向**，
+##     **不能**抵消，否则枪会恒指世界前方 -Z、与朝向无关
+## 曾因为这个差别出过 bug：对手的枪永远指向同一个方向。所以改成由宿主显式告知。
+## 替身保持默认 0 即可。
+var aim_lean := 0.0
+
 ## 手里的枪。没装备时为 null。
 ##
 ## 类型故意留空（不写 `Gun`）：headless 与 `--script` 模式不写全局类缓存，
@@ -508,16 +519,16 @@ func animate(move_speed: float, grounded: bool, delta: float, crouch := 0.0) -> 
 ##
 ## 要抵消/叠加的旋转有三级，漏掉任何一级枪口都会歪：
 ##   - 镜头的俯仰 `aim_pitch`（目标方向本身就带这个角）
-##   - 角色自身绕 Y 的偏身：`rotation.y`（方向键导致，最大 lean_deg）
+##   - 宿主告知的偏身 `aim_lean`（见该变量的注释，本地玩家与替身不同）
 ##   - 躯干绕 X 的前倾：`spine_lean`（步态导致，走路时一直存在）
-## 手臂的父级链累积起来就是 `Ry(rotation.y)·Rx(spine_lean)`，取其逆作用到目标方向上。
+## 手臂的父级链累积起来是 `Ry(aim_lean)·Rx(spine_lean)`，取其逆作用到目标方向上。
 ##
 ## 用“把 -Y 转到目标方向”的最小旋转来求，而不是手写欧拉角：欧拉顺序记错就会差 90°，
 ## 而且躯干前倾那一级很难手算。自检里那项“枪口对准飞行方向”会验证结果。
 func _aim_arm_rotation(spine_lean: float) -> Quaternion:
 	# 镜头在 Player 空间里绕 X 转了 aim_pitch，所以前方是 (0, sin, -cos)
 	var target := Vector3(0.0, sin(aim_pitch), -cos(aim_pitch))
-	target = Basis(Vector3.RIGHT, -spine_lean) * Basis(Vector3.UP, -rotation.y) * target
+	target = Basis(Vector3.RIGHT, -spine_lean) * Basis(Vector3.UP, -aim_lean) * target
 	return Quaternion(Vector3(0.0, -1.0, 0.0), target)
 
 

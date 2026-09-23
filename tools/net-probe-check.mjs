@@ -416,6 +416,18 @@ async function fireBurst(cdp, samples, opts = {}) {
   };
 }
 
+/** 按下或松开鼠标左键。
+ *
+ * 命中判定走的就是真实输入，所以截图之类的地方也必须用同一套事件，
+ * 不能去调游戏内部接口伪造。
+ */
+async function cdpFire(cdp, down) {
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: down ? "mousePressed" : "mouseReleased",
+    x: 640, y: 360, button: "left", clickCount: 1,
+  });
+}
+
 /** 轮询直到条件满足或超时。 */
 async function waitFor(fn, timeoutMs, stepMs = 250) {
   const deadline = Date.now() + timeoutMs;
@@ -748,6 +760,42 @@ async function checkShoot() {
   console.log(`  alpha ${JSON.stringify(me)} → beta ${JSON.stringify(them)}`
     + `，当前朝向 ${facingDeg.toFixed(1)}°，目标 ${targetYaw.toFixed(1)}°`);
 
+  // 先拍两张开火中的截图（曳光只活 70 毫秒，得在持续开火时抓）。
+  // 一张整屏、一张对准星周围放大：枪、血条、命中提示这类细节整屏看不清。
+  //
+  // 【时机】必须放在**第一轮开火之前**：后坐力是累积且不回落的，打几轮之后视角会被
+  // 永久抬高到看不见对手（实测截图里只剩曳光与准星），拍出来没有参考价值。
+  // 此时俯仰还是默认的 -12.6°，对手正在准星附近；而且对方满血，血条填充满宽、最清楚。
+  if (SHOT_DIR) {
+    await cdpFire(a.cdp, true);
+    await sleep(180);
+    fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+    const full = await a.cdp.send("Page.captureScreenshot", { format: "png" });
+    const fullFile = path.join(SHOT_DIR, "shoot-firing.png");
+    fs.writeFileSync(fullFile, Buffer.from(full.data, "base64"));
+    console.log(`  开火中截图 ${fullFile}`);
+
+    const vw = await a.cdp.evaluate("innerWidth");
+    const vh = await a.cdp.evaluate("innerHeight");
+    const cw = 150;
+    const ch = 120;
+    const zoom = await a.cdp.send("Page.captureScreenshot", {
+      format: "png",
+      clip: {
+        // 略高于屏幕中心：要盖上对方头顶的血条
+        x: Math.round(vw / 2 - cw / 2), y: Math.round(vh / 2 - ch * 0.75),
+        width: cw, height: ch, scale: 5,
+      },
+    });
+    const zoomFile = path.join(SHOT_DIR, "shoot-firing-zoom.png");
+    fs.writeFileSync(zoomFile, Buffer.from(zoom.data, "base64"));
+    console.log(`  准星放大截图 ${zoomFile}`);
+
+    await cdpFire(a.cdp, false);
+    await sleep(300);
+  }
+
   // 开火：按住一段时间（射速约 9 发/秒）。
   // 记时长是为了**反推射速**：主循环受帧率影响，但冷却按时间算，所以射速应当恒定。
   const shotsBefore = (await readStat(a.cdp))?.shots ?? 0;
@@ -807,49 +855,6 @@ async function checkShoot() {
   // 特效应当自己清掉，不能越积越多
   await sleep(1200);
   const fxAfter = (await readStat(a.cdp))?.fx ?? -1;
-
-  // 再补两张开火中的截图（曳光只活 45 毫秒，得在持续开火时抓）。
-  // 一张整屏、一张对准星周围放大：枪、血条、命中提示这类细节整屏看不清。
-  //
-  // 拍之前先等对方重生回满血、再只打一小段：不然截图里对方是 0 血，
-  // 血条填充会隐藏，就验证不了“血条随血量变化”这件事。
-  if (SHOT_DIR) {
-    await waitFor(async () => {
-      const s = await readStat(b.cdp);
-      return s && s.health >= 100;
-    }, 15_000, 400);
-
-    await a.cdp.send("Input.dispatchMouseEvent", {
-      type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
-    });
-    await sleep(180);
-    fs.mkdirSync(SHOT_DIR, { recursive: true });
-
-    const full = await a.cdp.send("Page.captureScreenshot", { format: "png" });
-    const fullFile = path.join(SHOT_DIR, "shoot-firing.png");
-    fs.writeFileSync(fullFile, Buffer.from(full.data, "base64"));
-    console.log(`  开火中截图 ${fullFile}`);
-
-    const vw = await a.cdp.evaluate("innerWidth");
-    const vh = await a.cdp.evaluate("innerHeight");
-    const cw = 150;
-    const ch = 120;
-    const zoom = await a.cdp.send("Page.captureScreenshot", {
-      format: "png",
-      clip: {
-        // 略高于屏幕中心：要盖上对方头顶的血条与自己的头
-        x: Math.round(vw / 2 - cw / 2), y: Math.round(vh / 2 - ch * 0.75),
-        width: cw, height: ch, scale: 5,
-      },
-    });
-    const zoomFile = path.join(SHOT_DIR, "shoot-firing-zoom.png");
-    fs.writeFileSync(zoomFile, Buffer.from(zoom.data, "base64"));
-    console.log(`  准星放大截图 ${zoomFile}`);
-
-    await a.cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
-    });
-  }
 
   console.log("");
   const results = [

@@ -193,6 +193,9 @@ func _physics_process(delta: float) -> void:
 	if figure != null:
 		# 持枪姿态要跟着镜头俯仰（含后坐力），否则枪口与子弹方向不一致
 		figure.aim_pitch = aim_pitch()
+		# figure 挂在 Player 下，所以它的 rotation.y 是"相对 Player 的偏身"，
+		# 需要告诉手柄把它抵消掉（替身则相反，见 stick_figure.aim_lean 的注释）。
+		figure.aim_lean = figure.rotation.y
 		figure.animate(
 			Vector2(velocity.x, velocity.z).length(), is_on_floor(), delta, _crouch
 		)

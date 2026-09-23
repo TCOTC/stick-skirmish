@@ -12,6 +12,18 @@ var _failures: Array[String] = []
 var _fig: Node = null
 var _checks_done := false
 
+# “本地玩家式”的宿主：一个带旋转的父节点，代表 Player。
+# **必须模拟这一层**：以前自检把 figure 直接挂在根节点下，那时“要抵消的偏身”与
+# “节点的世界朝向”恰好是同一个量，于是掩盖了两者含义不同这个事实，
+# 结果替身的枪永远指向同一个方向（父级没有旋转，抵消掉自己的旋转后就只剩世界前方）。
+var _mount: Node3D = null
+var _fig_local: Node = null
+const MOUNT_YAW := 0.6
+
+# 血条几何检查用的替身后血条与一个相机
+var _bar: Node3D = null
+var _bar_cam: Camera3D = null
+
 const HealthBarScript := preload("res://scripts/health_bar_3d.gd")
 
 # 枪口朝向的检查要**跨帧**做：骨骼附件的变换在帧内的内部处理里更新，
@@ -21,6 +33,8 @@ var _aim_now := Vector2.ZERO
 var _aim_waiting := false
 var _gun_worst := 0.0
 var _gun_details: Array[String] = []
+var _avatar_worst := 0.0
+var _avatar_details: Array[String] = []
 
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存，
 # 直接写 StickFigure 会报 "Could not find type"。
@@ -272,6 +286,23 @@ func _initialize() -> void:
 	# 枪要在 build 之后装备（配色取自样式材质）
 	_fig.equip_gun()
 
+	# 本地玩家式：figure 挂在一个带旋转的父节点下（父节点代表 Player）
+	_mount = Node3D.new()
+	_mount.name = "Mount"
+	_mount.rotation.y = MOUNT_YAW
+	root.add_child(_mount)
+	_fig_local = StickFigureScript.new()
+	_mount.add_child(_fig_local)
+	_fig_local.build()
+	_fig_local.equip_gun()
+
+	# 血条与一个相机：用来从各个方向验证血条的前后关系
+	_bar = HealthBarScript.new()
+	root.add_child(_bar)
+	_bar_cam = Camera3D.new()
+	root.add_child(_bar_cam)
+	_bar_cam.current = true
+
 
 func _process(_delta: float) -> bool:
 	if not _checks_done:
@@ -300,32 +331,53 @@ func _advance_lean() -> void:
 	if _aim_queue.is_empty():
 		_check(_gun_worst < 2.0, "枪口始终对准子弹方向（不受偏身与俯仰影响）",
 			"最大偏差 %.1f°（%s）" % [_gun_worst, "、".join(_gun_details)])
+		_check(_avatar_worst < 2.0, "替身的枪口跟着它自己的朝向转",
+			"最大偏差 %.1f°（%s）" % [_avatar_worst, "、".join(_avatar_details)])
+		_check_health_bar_geometry()
 		_finish()
 		return
 	_aim_now = _aim_queue.pop_front()
+	# 替身式：直接挂根节点，rotation.y 就是它的世界朝向，不抵消
 	_fig.rotation.y = _aim_now.x
 	_fig.aim_pitch = _aim_now.y
+	_fig.aim_lean = 0.0
 	_fig.animate(4.0, true, 1.0 / 60.0)
+	# 本地玩家式：挂带旋转的父节点下，rotation.y 是“相对父节点的偏身”，需抵消
+	_fig_local.rotation.y = _aim_now.x
+	_fig_local.aim_pitch = _aim_now.y
+	_fig_local.aim_lean = _aim_now.x
+	_fig_local.animate(4.0, true, 1.0 / 60.0)
 	_aim_waiting = true
 
 
 func _measure_muzzle(aim: Vector2) -> void:
-	var fwd: Vector3 = _fig.muzzle_forward()
-	# 期望方向：镜头在 Player 空间里绕 X 转了 aim_pitch，前方就是 (0, sin, -cos)。
-	# 角色自己的偏身与躯干前倾应当被手臂抵消掉，所以期望值与它们无关。
+	# --- 本地玩家式：期望枪口指向“父节点空间的前方” ---
 	var expect := Vector3(0.0, sin(aim.y), -cos(aim.y))
-	var dot := clampf(fwd.dot(expect), -1.0, 1.0)
-	var deg := rad_to_deg(acos(dot))
+	var world_expect: Vector3 = Basis(Vector3.UP, MOUNT_YAW) * expect
+	var local_fwd: Vector3 = _fig_local.muzzle_forward()
+	var deg := rad_to_deg(acos(clampf(local_fwd.dot(world_expect), -1.0, 1.0)))
 	_gun_worst = maxf(_gun_worst, deg)
 	_gun_details.append("偏身 %+.0f°/俯仰 %+.0f°→%.2f°" % [
 		rad_to_deg(aim.x), rad_to_deg(aim.y), deg])
-	# 枪口应当在身体前方（枪口指向 -Z，所以 z 更小）
+
+	# --- 替身式：期望枪口指向“它自己的前方” ---
+	# 这就是之前错的那一半：枪口应当随 rotation.y 一起转，而不是恒指世界前方。
+	var avatar_expect: Vector3 = Basis(Vector3.UP, aim.x) * expect
+	var avatar_fwd: Vector3 = _fig.muzzle_forward()
+	var avatar_deg := rad_to_deg(acos(clampf(avatar_fwd.dot(avatar_expect), -1.0, 1.0)))
+	_avatar_worst = maxf(_avatar_worst, avatar_deg)
+	_avatar_details.append("朝向 %+.0f°→%.2f°" % [rad_to_deg(aim.x), avatar_deg])
+
+	# 枪口应当在身体前方（枪口指向前方，所以 z 更小）
 	if aim == Vector2.ZERO:
-		var muzzle: Vector3 = _fig.muzzle_position()
+		var muzzle: Vector3 = _fig_local.muzzle_position()
+		var body: Vector3 = _fig_local.global_position
+		var to_muzzle := (muzzle - body)
+		var forward_dir: Vector3 = Basis(Vector3.UP, MOUNT_YAW) * Vector3(0.0, 0.0, -1.0)
 		_check(
-			muzzle.z < _fig.global_position.z - 0.5,
+			to_muzzle.dot(forward_dir) > 0.5,
 			"枪口在身体前方",
-			"枪口 z=%.2f、身体 z=%.2f" % [muzzle.z, _fig.global_position.z]
+			"枪口相对身体 %s，前方 %s" % [str(to_muzzle.snapped(Vector3(0.01, 0.01, 0.01))), str(forward_dir.snapped(Vector3(0.01, 0.01, 0.01)))]
 		)
 
 
@@ -531,6 +583,58 @@ func _check_health_bar() -> void:
 	root.add_child(full_bar)
 	full_bar.set_health(100, 100)
 	_check(full_bar.get_child_count() >= 2, "血条满血时也有底座", "%d 个子节点" % full_bar.get_child_count())
+
+
+## 血条的填充必须**从任何方向看都盖在底色上**。
+##
+## 这一项是补上的：两个方片几乎重合（只差 0.004），而 billboard 只改顶点朝向、**不改位置**，
+## 那点偏移的方向就随血条节点的旋转（= 替身朝向）变；再叠加 no_depth_test
+## （深度完全不参与判定），谁盖住谁就不再确定——从某些角度只看得见一个灰色矩形。
+##
+## 现在的做法是血条**节点自身**每帧转向相机，所以：
+##   1. 节点的 +Z 必须真的指向相机（旧写法里这条不成立，billboard 不体现在节点变换上）
+##   2. 填充沿 +Z 前移，于是沿“相机方向”总在底色之前
+func _check_health_bar_geometry() -> void:
+	if _bar == null or _bar_cam == null:
+		_check(false, "血条与相机已建立")
+		return
+	var back := _bar.get_node_or_null("quad") as MeshInstance3D
+	var front := _bar.get_node_or_null("FillPivot/quad") as MeshInstance3D
+	if back == null or front == null:
+		_check(false, "血条的底色与填充节点存在",
+			"底色 %s、填充 %s" % [back != null, front != null])
+		return
+	# 半血：填充不是满宽，更接近实战时的样子
+	_bar.set_health(50, 100)
+
+	var facing_worst := 1.0
+	var gap_worst := 999.0
+	var details: Array[String] = []
+	# 绕血条一圈，覆盖“从各个方向看”
+	for i in 12:
+		var angle := TAU * float(i) / 12.0
+		_bar_cam.global_position = _bar.global_position + Vector3(
+			cos(angle) * 3.0, 0.9, sin(angle) * 3.0
+		)
+		_bar_cam.look_at(_bar.global_position, Vector3.UP)
+		# 手动触发即可，不必等帧：相机的 global_position 是即时的
+		_bar.call("_face_camera")
+
+		var to_cam := (_bar_cam.global_position - _bar.global_position).normalized()
+		var bar_z: Vector3 = _bar.global_transform.basis.z
+		facing_worst = minf(facing_worst, bar_z.dot(to_cam))
+		# d 的 x 分量与血条的 z 轴垂直，所以这个点乘只反映“朝相机的前移量”
+		var gap := (front.global_position - back.global_position).dot(bar_z)
+		gap_worst = minf(gap_worst, gap)
+		if i % 3 == 0:
+			details.append("%.0f°:%.3f" % [rad_to_deg(angle), gap])
+
+	_check(facing_worst > 0.99, "血条真的转向相机（各个方向）",
+		"最小 dot=%.3f" % facing_worst)
+	# 这一条测的是“填充沿血条自身 z 轴的前移量”，**只有上一条成立时**才等于
+	# “从相机看填充在底色之前”。上一条失败时它可能仍然显示 ok，别被误导。
+	_check(gap_worst > 0.005, "填充沿血条正面比底色靠前（依赖上一条成立）",
+		"最小前移 %.4f 米（%s）" % [gap_worst, "、".join(details)])
 
 
 ## 收尾：汇总与退出。枪口朝向那几项是跨帧测的，所以不能写在 _run_checks 里。
