@@ -35,6 +35,9 @@ var reset_left := 0.0
 var _intro_left := 0.0
 # 编号 → {kills, deaths}。字典是引用类型，_entry() 返回后可以直接改。
 var _scores: Dictionary = {}
+# 上一次推给 HUD 的横幅内容。它每帧都会被算一次，但只在真的变了时才去改 Label：
+# add_theme_color_override 每次都会让主题缓存失效，每帧调没有必要。
+var _banner_key := ""
 
 
 func _ready() -> void:
@@ -166,6 +169,10 @@ func _process(delta: float) -> void:
 ## 分开写会打架——比如“等待对手”刚好在回合开场的两秒里把人家的 ROUND 1 盖掉。
 ## 优先级就是下面的顺序：结算 > 开场 > 等待。
 func _check_round_banner() -> void:
+	var key := _banner_state_key()
+	if key == _banner_key:
+		return
+	_banner_key = key
 	if over:
 		var won := winner_id == Net.my_id
 		# 横幅上除了胜负，还要把最终比分写清楚：两个人都在同一块屏幕上对不上号时，
@@ -185,6 +192,17 @@ func _check_round_banner() -> void:
 		_hud_call("banner", ["WAITING FOR OPPONENT", _room_hint(), Color(0.80, 0.86, 0.95)])
 		return
 	_hud_call("banner", ["", ""])
+
+
+## 横幅当前应当显示哪一态。它变了才需要重写 Label。
+func _banner_state_key() -> String:
+	if over:
+		return "over:%d" % winner_id
+	if _intro_left > 0.0:
+		return "intro:%d" % round
+	if Net.connected and not Net.has_opponent():
+		return "waiting"
+	return "none"
 
 
 ## 等待时告诉对方怎么进来：带上房间名，两台机器用同一个房间才会相遇。
