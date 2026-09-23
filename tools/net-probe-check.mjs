@@ -389,6 +389,8 @@ async function fireBurst(cdp, samples, opts = {}) {
   // 散布跟着连发增长、同时音效播放器会被起起来，这两项只能在开火**期间**取样。
   let maxSpread = before?.spreadDeg ?? 0;
   let maxSounds = 0;
+  // 准星间距（散布的可视化）也只能在开火期间取。
+  let maxGap = before?.hud?.crosshairGap ?? 0;
   // 击杀提示只挂 3.5 秒，而一轮射击之后测试还要跑十几秒，所以也得在开火期间取。
   let feedSeen = "";
 
@@ -402,6 +404,7 @@ async function fireBurst(cdp, samples, opts = {}) {
       peak = Math.max(peak, s.pitchDeg ?? 0);
       maxSpread = Math.max(maxSpread, s.spreadDeg ?? 0);
       maxSounds = Math.max(maxSounds, s.sounds ?? 0);
+      maxGap = Math.max(maxGap, s.hud?.crosshairGap ?? 0);
       if (!feedSeen && s.hud?.feed) feedSeen = s.hud.feed;
     }
     if (opts.watch) {
@@ -425,6 +428,7 @@ async function fireBurst(cdp, samples, opts = {}) {
     minHealth,
     maxSpread,
     maxSounds,
+    maxGap,
     feedSeen,
     shotsBefore: before?.shots ?? 0,
     shotsAfter: afterRelease?.shots ?? 0,
@@ -927,6 +931,8 @@ async function checkShoot() {
   const spreadRecovered = finalA?.spreadDeg ?? -1;
   const spreadMin = crouchBefore?.spreadMinDeg ?? 0;
   const spreadMax = crouchBefore?.spreadMaxDeg ?? 0;
+  // 静止时的准星间距（散布在最小值的状态），用来对比“开火时张开了多少”
+  const baseGap = ready.sa.hud?.crosshairGap ?? 0;
 
   const idA = ready.sa.myId;
   const idB = ready.sb.myId;
@@ -984,6 +990,8 @@ async function checkShoot() {
       `1.2 秒后 ${spreadRecovered}°，最小 ${spreadMin}°`],
     ["开火起了音效播放器", standBurst.maxSounds > 0,
       `开火期间同时有 ${standBurst.maxSounds} 个音效在播`],
+    ["准星间距跟着散布张开", standBurst.maxGap > baseGap + 1.5,
+      `准星间距 ${baseGap} → ${standBurst.maxGap} 像素（散布 ${spreadMin}° → ${standBurst.maxSpread.toFixed(2)}°）`],
     ["打中对方后开枪方出现命中提示", (finalA?.hud?.hitmarkers ?? 0) > 0,
       `命中提示 ${finalA?.hud?.hitmarkers ?? 0} 次`],
     ["击倒对方时出现击杀提示", (finalA?.hud?.kills ?? 0) > 0,
@@ -1145,6 +1153,9 @@ async function checkScore() {
     ["击杀提示出现在两端",
       (scored?.sa?.hud?.feed ?? "").includes(nameB) && (scored?.sb?.hud?.feed ?? "").includes(nameB),
       `alpha "${scored?.sa?.hud?.feed ?? ""}" / beta "${scored?.sb?.hud?.feed ?? ""}"`],
+    ["倒下时溅出碎屑（两端各算一次）",
+      (scored?.sa?.fxBursts ?? 0) >= 1 && (scored?.sb?.fxBursts ?? 0) >= 1,
+      `alpha ${scored?.sa?.fxBursts ?? "-"} 次 / beta ${scored?.sb?.fxBursts ?? "-"} 次`],
     ["结算期间真的离开了出生点", movedDist > 0.5 || turnedDeg > 5,
       `位移 ${movedDist.toFixed(2)} 米、转身 ${turnedDeg.toFixed(1)}°（这样“重置回出生点”才有意义）`],
     ["下一回合比分清零", (resetScoresA[String(idA)]?.kills ?? -1) === 0

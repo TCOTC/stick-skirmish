@@ -21,6 +21,14 @@ const FEED_MAX := 4
 ## 受伤红闪的淡出时长（秒）。
 const FLASH_TIME := 0.35
 
+## 准星刻度：四根短线，间距跟着当前散布张开。散布大时口子大。
+## 这是玩家唯一能“看见”散布的地方——否则散布只是个看不见的数值。
+const CROSS_BASE_GAP := 4.0
+const CROSS_GAP_PER_DEG := 3.2
+const CROSS_LEN := 6.0
+const CROSS_THICK := 1.5
+const CROSS_COLOR := Color(0.23, 0.88, 1.0, 0.85)
+
 var _bar_fill: ColorRect = null
 var _bar_label: Label = null
 var _hitmarker: Label = null
@@ -41,6 +49,9 @@ var _feed: Array = []
 
 var _flash: ColorRect = null
 var _flash_tween: Tween = null
+# 准星的四根刻度（上、下、左、右），以及当前间距（用来避免重复布局）。
+var _cross: Array[ColorRect] = []
+var _cross_gap := -1.0
 
 # 命中提示出现过几次（含击杀）。供自动化检查确认提示真的触发过。
 var _hitmarker_count := 0
@@ -56,6 +67,7 @@ func _ready() -> void:
 	_build_banner()
 	_build_feed()
 	_build_flash()
+	_build_crosshair()
 	# 初始值先填上：player.gd 在 _ready 里推血量时，HUD 可能还没进 group，
 	# 靠那次推送会留下一个空白的血量文字。
 	set_health(100, 100)
@@ -125,7 +137,6 @@ func set_down(seconds: float, killer := "") -> void:
 
 
 # --- 比分板 / 横幅 / 击杀提示 -----------------------------------------------
-
 ## 比分板。rows 是 [{name, kills, deaths, me}]，按进入顺序排。
 ## 幂等：行数不变就只改文字，不重建控件。
 func scoreboard(title: String, rows: Array) -> void:
@@ -207,6 +218,10 @@ func _tick_feed(delta: float) -> void:
 
 
 # --- 供自动化检查读取 -------------------------------------------------------
+
+## 准星间距（像素）。散布变化时自动化检查靠它确认“准星真的跟着张开了”。
+func crosshair_gap() -> float:
+	return snappedf(_cross_gap, 0.1)
 
 ## 比分板的文字（按行用 " | " 连接）。检查“界面真的显示了比分”要靠它，
 ## 只读 Match 里的数字不够——数字对、界面没画出来也是一样的。
@@ -383,3 +398,45 @@ func _build_flash() -> void:
 	# 铺满整屏的控件若参与 GUI 输入，会把点击吞掉（接管鼠标也要靠那一下点击）。
 	_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(_flash)
+
+
+## 准星刻度。中心那个方块在 main.tscn 里，这里只加四根会动的短线。
+func _build_crosshair() -> void:
+	for i in 4:
+		var rect := ColorRect.new()
+		rect.name = "Cross%d" % i
+		rect.anchor_left = 0.5
+		rect.anchor_top = 0.5
+		rect.anchor_right = 0.5
+		rect.anchor_bottom = 0.5
+		rect.color = CROSS_COLOR
+		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		add_child(rect)
+		_cross.append(rect)
+		# 0/1 是上下两根（竖向短杆），2/3 是左右两根（横向短杆）
+		if i < 2:
+			rect.offset_left = -CROSS_THICK * 0.5
+			rect.offset_right = CROSS_THICK * 0.5
+		else:
+			rect.offset_top = -CROSS_THICK * 0.5
+			rect.offset_bottom = CROSS_THICK * 0.5
+	set_spread(0.0)
+
+
+## 散布（度）→ 准星间距。角度越大，口子越开。
+## 幂等：间距没变就不重新摆（每帧调也不会产生多余工作）。
+func set_spread(deg: float) -> void:
+	if _cross.size() < 4:
+		return
+	var gap := CROSS_BASE_GAP + clampf(deg, 0.0, 20.0) * CROSS_GAP_PER_DEG
+	if absf(gap - _cross_gap) < 0.05:
+		return
+	_cross_gap = gap
+	_cross[0].offset_top = -gap - CROSS_LEN
+	_cross[0].offset_bottom = -gap
+	_cross[1].offset_top = gap
+	_cross[1].offset_bottom = gap + CROSS_LEN
+	_cross[2].offset_left = -gap - CROSS_LEN
+	_cross[2].offset_right = -gap
+	_cross[3].offset_left = gap
+	_cross[3].offset_right = gap + CROSS_LEN

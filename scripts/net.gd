@@ -548,6 +548,7 @@ func _publish() -> void:
 		"spreadMinDeg": spread_min_deg,
 		"spreadMaxDeg": spread_max_deg,
 		"fx": _count_fx(),
+		"fxBursts": Fx.burst_count(),
 		"headScreenY": head_screen_y,
 		"sounds": Sfx.live_voices(),
 		"match": Match.snapshot(),
@@ -576,6 +577,7 @@ func _hud_info() -> Dictionary:
 		"hitmarkers": int(hud.call("hitmarker_count")),
 		"kills": int(hud.call("kill_count")),
 		"down": str(hud.call("down_text")),
+		"crosshairGap": float(hud.call("crosshair_gap")),
 	}
 
 
@@ -710,6 +712,10 @@ func _peer_fire(shooter_id: int, origin: Vector3, direction: Vector3) -> void:
 func _peer_kill(victim_id: int, killer_id: int) -> void:
 	if victim_id == my_id or victim_id <= 1:
 		return
+	# 倒下的一瞬间溅一团碎屑：位置取替身当前位置，效果只在本机播，不需要同步。
+	var avatar = _avatars.get(victim_id)
+	if avatar != null:
+		Fx.burst(avatar.global_position + Vector3(0.0, 1.1, 0.0), avatar.limb_color())
 	Match.apply_remote_kill(victim_id, killer_id)
 
 

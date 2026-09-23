@@ -120,6 +120,8 @@ var _spawn_yaw := 0.0
 var _spawn_known := false
 # 当前的散布半径（度）。跟着连发增长、停火回落。
 var _spread := 0.0
+# 已经推给 HUD 的散布值，用来避免每帧都去查 HUD。
+var _pushed_spread := -1.0
 # 最后把自己打倒的人的编号与名字（用于记分与倒地提示）。
 var _killer_id := 0
 var _killer_name := ""
@@ -196,6 +198,7 @@ func _physics_process(delta: float) -> void:
 	# 散布回落。与生死无关，所以放在存活判断之前。
 	_spread = maxf(spread_min_deg, _spread - spread_recover_per_sec * delta)
 	_shake = maxf(0.0, _shake - shake_recover * delta)
+	_push_spread()
 
 	# 这两件事与生死无关（倒地时枪口姿态也要正确收尾），所以放在存活判断之前。
 	_update_stance(active, delta)
@@ -278,6 +281,19 @@ func crouch_amount() -> float:
 ## 当前散布半径（度）。供自动化检查与快照读取。
 func spread_amount() -> float:
 	return _spread
+
+
+## 把散布告诉 HUD（准星间距跟着张开）。
+##
+## 只在数值真的变了的时候才去拿 HUD 节点：`_hud()` 是一次 group 查询，
+## 每帧都调没有必要，而散布只在开火与回落期间变化。
+func _push_spread() -> void:
+	if absf(_spread - _pushed_spread) < 0.04:
+		return
+	_pushed_spread = _spread
+	var hud := _hud()
+	if hud != null:
+		hud.call("set_spread", _spread)
 
 
 ## 开一发的后坐力：把准星往上抬一点、并左右随机偏一点，**而且都留在那里**。
@@ -409,6 +425,9 @@ func _try_fire() -> void:
 	# 写在前面的话，连第一发都会偏掉一个后坐力步长。
 	_kick_recoil()
 	_spread = minf(spread_max_deg, _spread + spread_per_shot_deg)
+	# 这一发已经让散布变大了，准星要**同一帧**跟上：放到下一帧再推的话，
+	# 显示的间距会永远比真实散布少一发，看起来像准星没跟上。
+	_push_spread()
 
 
 ## 在方向周围取一个随机偏移，偏角最大为当前散布半径。
@@ -486,6 +505,8 @@ func _die() -> void:
 	var hud := _hud()
 	if hud != null:
 		hud.call("damage_flash", 0.55)
+	if figure != null:
+		Fx.burst(global_position + Vector3(0.0, 1.1, 0.0), figure.limb_color())
 	# 记分交给 Match：它是唯一维护比分与回合的地方。这里只上报**被打者的认定**，
 	# 开枪的人是谁由击杀事件告诉所有人（见 match.gd 的文件头）。
 	Match.report_local_death(_killer_id)
