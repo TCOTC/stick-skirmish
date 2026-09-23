@@ -179,6 +179,10 @@ func _build_figure() -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		# 倒地期间不许转视角。躺下的人还能扭头看起来很奇怪，
+		# 而且鼠标朝向同时也是**子弹方向**的基准，重生后不该继承一个“尸体拧过头”的视角。
+		if not alive:
+			return
 		rotate_y(-event.relative.x * mouse_sensitivity)
 		_pitch = clampf(
 			_pitch - event.relative.y * mouse_sensitivity,
@@ -246,11 +250,16 @@ func _physics_process(delta: float) -> void:
 	_push_spread()
 
 	# 这两件事与生死无关（倒地时枪口姿态也要正确收尾），所以放在存活判断之前。
-	_update_stance(active, delta)
+	# 下蹲额外要求活着：尸体按 Shift 不该蹲起来。
+	_update_stance(active and alive, delta)
 	_apply_aim()
 
 	if not alive:
 		_tick_respawn(delta)
+		# 倒地姿态也要推进：倒下是由 `dead` 派生的**平滑旋转**（见 stick_figure.animate），
+		# 不在这里调它的话身体会永远停在倒下的第一帧。
+		if figure != null:
+			figure.animate(0.0, is_on_floor(), delta, _crouch, true)
 		# 倒地时不能让旧速度留着，否则尸体会滑行
 		velocity.x = 0.0
 		velocity.z = 0.0
@@ -325,6 +334,11 @@ func _apply_aim() -> void:
 ## 下蹲程度（0 站、1 蹲）。供自动化检查与网络同步读取。
 func crouch_amount() -> float:
 	return _crouch
+
+
+## 是否活着。联机侧同步这一个布尔值，两端各自把“倒地”派生成躺姿（见 stick_figure）。
+func is_alive() -> bool:
+	return alive
 
 
 ## 当前散布半径（度）。供自动化检查与快照读取。
@@ -553,9 +567,10 @@ func _die() -> void:
 	alive = false
 	_respawn_left = respawn_delay
 	velocity = Vector3.ZERO
-	if figure != null:
-		# 侧倒：绕 X 倒下去（figure 的 rotation.y 由 _update_lean 改，x 是空闲的）
-		figure.rotation.x = deg_to_rad(85.0)
+	# 松手：倒地之后不该还能“按住扳机”，否则重生那一瞬会凭空打出一发。
+	_release_trigger()
+	# 身体怎么躺下不在这里写：那是 stick_figure 按 alive 派生的姿态（见它的 FALL_TILT_DEG），
+	# 联机替身用的是同一套逻辑，所以两端看到的躺姿一致。
 	Sfx.play_death()
 	var hud := _hud()
 	if hud != null:
@@ -583,8 +598,7 @@ func respawn() -> void:
 	if _spawn_known:
 		global_position = _spawn_pos
 	velocity = Vector3.ZERO
-	if figure != null:
-		figure.rotation.x = 0.0
+	# 站起来也是派生的（figure 会在几帧内把 _fall 收回 0），这里不直接写 rotation.x。
 	Sfx.play_spawn()
 	_update_hud()
 	_set_hud_down(0.0)

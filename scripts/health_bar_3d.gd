@@ -25,6 +25,7 @@ const HEIGHT := 0.12
 ## 墨色外框每边多出来的宽度。填充是纸白、底色是墨，所以这一圈就是“描边”。
 const BORDER := 0.028
 const HEIGHT_ABOVE := 2.05   # 火柴人约 1.75 米高，放在头顶上方
+
 ## 填充相对底色的前移量。它现在**朝相机**（局部 +Z 由 look_at 保证），
 ## 所以不会随替身朝向变成“跑到后面去”，可以放心用几何前后关系定顺序。
 const FILL_FORWARD := 0.012
@@ -41,7 +42,22 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
+	_keep_height()
 	_face_camera()
+
+
+## 把血条保持在与宿主**世界原点**上方固定高度处。
+##
+## 为什么要按世界位置算，而不是用本地偏移：替身倒地时整个节点绕 X 转了 85°，
+## 于是本地 (0, 2.05, 0) 会映射到“身后 2 米、贴地”——牌子会掉在地上，像是掉了。
+## 宿主站立时两种算法结果完全相同（它只绕 Y 转），所以这里不会引入任何变化。
+func _keep_height() -> void:
+	var host := get_parent_node_3d()
+	if host == null:
+		return
+	var pos := host.global_position
+	pos.y += HEIGHT_ABOVE
+	global_position = pos
 
 
 ## 更新血量。`frac` 会做 0..1 限制，所以传入超范围的数也不会画歪。

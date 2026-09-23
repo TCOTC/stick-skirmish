@@ -135,6 +135,23 @@ const CROUCH_KNEE := 0.85
 const CROUCH_LEG := 0.30
 const CROUCH_LEAN := 0.16
 
+# 倒地姿态：绕 X 轴向后倒（仰面）。
+#
+# 【为什么放在节点自身】旋转发生在这个节点上，于是两个宿主都自动成立：
+#   - 本地玩家：figure 是 Player 的子节点，相机挂在 SpringArm 上，**不会**跟着倒；
+#     而且玩家自己的碰撞胶囊也不动（反正倒地时已不再吃伤害）
+#   - 联机替身：替身本身就是这个节点，所以挂在它下面的**命中框跟着倒**
+#     （否则镜头会停在空中一个站着的隐形盒子上），头顶血条每帧 look_at 相机，不受影响
+#
+# 【为什么只是姿态】倒地与否是**姿态**而不是状态机：它由宿主的「活着」布尔值派生，
+# 两端各算各的，所以同步只需要带一个布尔值（见 net.gd 的 `_peer_state`）。
+# 角度取 85° 而不是 90°：完全贴地会和地板面打架，留一点角度还能看出是个人。
+const FALL_TILT_DEG := 85.0
+## 倒下的速度（每秒完成的比例）。快得看得出是“倒下”而不是“瞬移”，又不拖沓。
+const FALL_RATE := 4.5
+## 倒地时自动愈合到“站姿”的速度。比倒下快：重生时应该很快站稳。
+const RISE_RATE := 6.0
+
 # 关节球：[骨骼, 相对位置, 半径系数]。填住两段圆柱转动时裂开的 V 形缝。
 const JOINTS: Array = [
 	["upper_arm_l", Vector3.ZERO, 1.35],
@@ -181,6 +198,8 @@ var _eye_mat: StandardMaterial3D = null
 var _phase := 0.0
 var _amp := 0.0
 var _air := 0.0
+## 倒地程度：0 = 站着，1 = 完全躺下。由 `animate()` 按宿主给的 dead 标志平滑。
+var _fall := 0.0
 var _built := false
 
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
@@ -231,6 +250,11 @@ func apply_style(index: int) -> void:
 
 func style_name() -> String:
 	return str(STYLES[style_index]["name"])
+
+
+## 当前倒地程度（0 站、1 躺）。供自动化检查读取，也供联机侧画替身。
+func fall_amount() -> float:
+	return _fall
 
 
 ## 读取某根骨头当前的俯仰角（弧度），供自动化检查判断"关节到底动没动"。
@@ -491,7 +515,16 @@ func _add_chest_band(radius: float) -> void:
 
 ## 每帧驱动步态。本机玩家传物理速度；替身传由收到的位置差分算出的速度。
 ## crouch 是下蹲程度（0 站、1 蹲），替身由同步过来的值给出。
-func animate(move_speed: float, grounded: bool, delta: float, crouch := 0.0) -> void:
+## dead 是宿主是否已倒地（本地取 `player.alive`，替身取同步过来的值）。
+func animate(
+	move_speed: float, grounded: bool, delta: float, crouch := 0.0, dead := false
+) -> void:
+	# 倒地放在最前面，而且**不受骨架是否就绪影响**：它只是这个节点自身的旋转。
+	var target := 1.0 if dead else 0.0
+	var rate := FALL_RATE if dead else RISE_RATE
+	_fall = move_toward(_fall, target, delta * rate)
+	rotation.x = deg_to_rad(FALL_TILT_DEG) * _fall
+
 	if _skeleton == null:
 		return
 

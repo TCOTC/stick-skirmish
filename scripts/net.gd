@@ -204,8 +204,9 @@ func _send_state(delta: float) -> void:
 	# 本地火柴人跟着移动方向转，发镜头朝向的话双方看到的脸就不一致了。
 	# kills/deaths 也一并带上，但接收方**只在第一次见到这个编号时**用它补种比分
 	# （见 match.gd 的文件头），之后比分只跟击杀事件走。
+	# **alive 必须带**：对方倒地后要能看到他躺下（躺姿由这个布尔值派生，见 stick_figure）。
 	rpc("_peer_state", my_id, _player.global_position, _visual_yaw(), _visual_pitch(),
-		_visual_crouch(), Match.my_kills(), Match.my_deaths())
+		_visual_crouch(), Match.my_kills(), Match.my_deaths(), _visual_alive())
 
 
 ## 问玩家节点要当前的外观朝向。外观策略属于 player.gd，这里不自己拼 rotation.y。
@@ -232,10 +233,21 @@ func _visual_crouch() -> float:
 	return 0.0
 
 
+## 是否还活着。替身据此摆**躺姿**。
+##
+## 只同步这一个布尔值就够：躺下的角度由它平滑派生（见 stick_figure 的 FALL_TILT_DEG），
+## 两端算出来的姿势一致，不必把旋转角当状态发过来。
+func _visual_alive() -> bool:
+	if _player != null and _player.has_method("is_alive"):
+		return bool(_player.call("is_alive"))
+	return true
+
+
 ## 收到的每个包都会被标成来自 1 号，所以发送者身份只能自己写在参数里。
 @rpc("any_peer", "call_remote")
 func _peer_state(
-	id: int, pos: Vector3, yaw: float, pitch: float, crouch: float, kills: int, deaths: int
+	id: int, pos: Vector3, yaw: float, pitch: float, crouch: float,
+	kills: int, deaths: int, alive: bool
 ) -> void:
 	if id == my_id or id <= 1:
 		return
@@ -256,6 +268,7 @@ func _peer_state(
 	entry["yaw"] = yaw
 	entry["pitch"] = pitch
 	entry["crouch"] = crouch
+	entry["alive"] = alive
 	entry["at"] = now
 	entry["speed"] = speed
 	entry["grounded"] = pos.y < GROUND_Y_MAX
@@ -409,9 +422,11 @@ func _smooth_avatars(delta: float) -> void:
 		else:
 			avatar.rotation.y = lerp_angle(avatar.rotation.y, yaw, weight)
 		avatar.aim_pitch = float(entry.get("pitch", 0.0))
+		# 倒地：把同步过来的“是否活着”交给外观，由它平滑成躺姿。
+		# 阵亡的人不再移动，所以速度自然是 0，腿也跟着停在最后那个姿势上。
 		avatar.animate(
 			float(entry.get("speed", 0.0)), bool(entry.get("grounded", true)), delta,
-			float(entry.get("crouch", 0.0))
+			float(entry.get("crouch", 0.0)), not bool(entry.get("alive", true))
 		)
 
 
@@ -466,6 +481,8 @@ func _publish() -> void:
 			# 身体随方向键的偏转，用于验证那张偏转表（后退时镜像）。
 			"leanDeg": snappedf(rad_to_deg(figure.rotation.y), 0.1),
 			"camYawDeg": snappedf(rad_to_deg(_cam_offset()), 0.1),
+			# 倒地程度（0 站、1 躺）。躺姿由 alive 派生，所以它是“本端看到的自己”。
+			"fall": snappedf(figure.fall_amount(), 0.01),
 		}
 
 	var pos := Vector3.ZERO
@@ -476,6 +493,11 @@ func _publish() -> void:
 	var avatar_yaw := {}
 	for id in _avatars:
 		avatar_yaw[str(id)] = snappedf(rad_to_deg(_avatars[id].rotation.y), 0.1)
+
+	# 替身的倒地程度（0 站、1 躺）。自动化检查靠它断言“对方倒地后能看到他躺下”。
+	var avatar_fall := {}
+	for id in _avatars:
+		avatar_fall[str(id)] = snappedf(_avatars[id].fall_amount(), 0.01)
 
 	# 替身的位置。射击检查要用它算出“该朝哪边转才能打到对方”。
 	var peer_pos := {}
@@ -556,12 +578,19 @@ func _publish() -> void:
 		"avatarPos": avatar_pos,
 		"avatars": _avatars.size(),
 		"avatarYawDeg": avatar_yaw,
+		"avatarFall": avatar_fall,
+		"peerAlive": _peer_alive(),
 		"avatarDecor": decor,
 		"figure": figure_info,
 		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
 		"health": own_health,
+		"alive": _visual_alive(),
 		"shots": shots,
 		"trigger": _trigger_info(),
+		# 鼠标是否已接管（键盘与鼠标事件只在接管后生效）。
+		# 报出来是因为它是**很多断言的前提**：没接管时“按住 W 会移动”这类检查
+		# 结果是“没动”，但那并不代表逻辑有问题。有它就能把前提也断言上。
+		"mouseCaptured": Input.mouse_mode == Input.MOUSE_MODE_CAPTURED,
 		"recoilDeg": pitch_deg,
 		"crouch": crouch,
 		"pitchDeg": pitch_deg,
@@ -592,6 +621,14 @@ func _trigger_info() -> Dictionary:
 	if _player != null and _player.has_method("trigger_state"):
 		return _player.call("trigger_state")
 	return {"held": false, "pulse": 0.0, "raw": false}
+
+
+## 编号 → 对方是否还活着（收到的值，来自 `_peer_state`）。
+func _peer_alive() -> Dictionary:
+	var out := {}
+	for id in _targets:
+		out[str(id)] = bool(_targets[id].get("alive", true))
+	return out
 
 
 ## 编号 → 名字，供自动化检查核对两端对同一个人的称呼是否一致。

@@ -388,6 +388,24 @@ async function clickToCapture(cdp) {
   return false;
 }
 
+/**
+ * 确保这个页面还处于“已接管鼠标”的状态，必要时重新点一下。
+ *
+ * 【为什么需要】给另一个实例发真实鼠标按下（哪怕只是想测“尸体不能开枪”），
+ * 会让**那个实例的页面**去请求全屏 + 指针锁定，而这会把本实例的指针锁定挤掉：
+ * 没接管时键盘与鼠标事件根本不生效，于是后面的“按住 D 会移动”“横移鼠标会转身”
+ * 都会静默变成“没动”。实测过：移动只剩 1.07 米、转身 0°（正常是 8 米、20°）。
+ */
+async function ensureCaptured(cdp, label) {
+  await cdp.send("Page.bringToFront");
+  await sleep(300);
+  if (await cdp.evaluate("!!document.pointerLockElement")) return true;
+  const ok = await clickToCapture(cdp);
+  if (ok) usedPointerLock = true;
+  console.log(`  ${label} 的指针锁定被挤掉了，已重新点击接管: ${ok}`);
+  return ok;
+}
+
 /** 把角度差归一化到 -180..180。 */
 function angleDiff(a, b) {
   return ((a - b) % 360 + 540) % 360 - 180;
@@ -440,24 +458,43 @@ async function fireBurst(cdp, samples, opts = {}) {
   let maxGap = before?.hud?.crosshairGap ?? 0;
   // 击杀提示只挂 3.5 秒，而一轮射击之后测试还要跑十几秒，所以也得在开火期间取。
   let feedSeen = "";
+  // 倒地程度也必须**开火期间**盯：对方重生（3 秒）后就会站起来，
+  // 打完再读只能拿到 0。这是本项目反复踩过的那类“采样时机”问题。
+  // 三个量分开记，别混：
+  //   peerFallMax   —— 开枪方看到的**替身**（对方躺着没）
+  //   victimFallMax —— 被打者**自己**看到的（他自己的本体躺着没）
+  //   shooterFallMax—— 开枪方**自己**的（他不该倒；混进去的话这条就没法验了）
+  let peerFallMax = 0;
+  let victimFallMax = 0;
+  let shooterFallMax = 0;
+  let stopped = false;
 
   await cdp.send("Input.dispatchMouseEvent", {
     type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
   });
   for (let i = 0; i < samples; i++) {
     const s = await readStat(cdp);
+    let w = null;
     if (s) {
       if (opts.fxSink) opts.fxSink.push(s.fx);
       peak = Math.max(peak, s.pitchDeg ?? 0);
       maxSpread = Math.max(maxSpread, s.spreadDeg ?? 0);
       maxSounds = Math.max(maxSounds, s.sounds ?? 0);
       maxGap = Math.max(maxGap, s.hud?.crosshairGap ?? 0);
+      shooterFallMax = Math.max(shooterFallMax, s.figure?.fall ?? 0);
       if (!feedSeen && s.hud?.feed) feedSeen = s.hud.feed;
     }
     if (opts.watch) {
-      const w = await readStat(opts.watch);
+      w = await readStat(opts.watch);
       if (w) minHealth = Math.min(minHealth, w.health);
+      // 被打者自己那一份。开枪方看到的替身从 s.avatarFall 取（同一次采样）。
+      if (w) victimFallMax = Math.max(victimFallMax, w.figure?.fall ?? 0);
+      for (const id of Object.keys(s?.avatarFall ?? {})) {
+        peerFallMax = Math.max(peerFallMax, s.avatarFall[id] ?? 0);
+      }
     }
+    // “打到就停”：击倒对方的窗口只有 respawn_delay（3 秒），早停一秒就多一秒余量。
+    if (opts.stopWhen && opts.stopWhen(s, w)) { stopped = true; break; }
     await sleep(60);
   }
   await cdp.send("Input.dispatchMouseEvent", {
@@ -465,7 +502,7 @@ async function fireBurst(cdp, samples, opts = {}) {
   });
   // 松手后要等一拍再读：Godot 还没处理完这次松开时，冷却到点就会又打出一发，
   // 于是“松手瞬间的俯仰”会偏小，被误判成“回落了”。
-  await sleep(500);
+  await sleep(opts.settleMs ?? 500);
 
   const afterRelease = await readStat(cdp);
   return {
@@ -477,6 +514,10 @@ async function fireBurst(cdp, samples, opts = {}) {
     maxSounds,
     maxGap,
     feedSeen,
+    peerFallMax,
+    victimFallMax,
+    shooterFallMax,
+    stopped,
     shotsBefore: before?.shots ?? 0,
     shotsAfter: afterRelease?.shots ?? 0,
   };
@@ -1086,6 +1127,13 @@ async function checkShoot() {
     ["被打的人扣了血", betaHealth < 100, `beta 最低血量 ${betaHealth}`],
     ["血量归零后重生回满血", betaHealth > 0 || revived !== null,
       betaHealth > 0 ? `未打死（剩 ${betaHealth}）` : `重生后 ${revived?.health ?? "未恢复"}`],
+    ["倒地后对方看得到他躺下（替身躺姿）", betaHealth > 0 || standBurst.peerFallMax > 0.9,
+      `开火期间替身最大倒地程度 ${standBurst.peerFallMax.toFixed(2)}（0 站、1 躺）`],
+    ["倒地后本端也看得到自己躺下", betaHealth > 0 || standBurst.victimFallMax > 0.9,
+      `开火期间被打者本体最大倒地程度 ${standBurst.victimFallMax.toFixed(2)}`],
+    ["倒地标记没串到没死的那个人身上", standBurst.shooterFallMax < 0.1,
+      `alpha 全程站着（他自己的倒地程度最大 ${standBurst.shooterFallMax.toFixed(2)}；`
+      + `他看到的替身 ${standBurst.peerFallMax.toFixed(2)}、beta 自己的 ${standBurst.victimFallMax.toFixed(2)}）`],
     ["开火让散布变大", standBurst.maxSpread > spreadMin + 0.3,
       `散布 ${spreadMin}° → ${standBurst.maxSpread.toFixed(2)}°（上限 ${spreadMax}°，配置值）`],
     ["散布不超过上限", standBurst.maxSpread <= spreadMax + 0.15,
@@ -1180,13 +1228,33 @@ async function checkScore() {
   const spawnYawA = ready.sa.figure.bodyYawDeg;
   const introScoreboard = ready.sa.hud.scoreboard;
 
-  const locked = await clickToCapture(a.cdp);
+  const locked = await ensureCaptured(a.cdp, "alpha");
   if (locked) usedPointerLock = true;
   console.log(`  指针锁定: ${locked}`);
   await sleep(800);
 
+  // --- 倒地状态：两侧都得看到他躺下，而且倒地期间不能再操作 ---
+  //
+  // 【先让 beta 也接管鼠标】这是三条“倒地期间不能操作”断言的前提：没接管时
+  // 键盘与鼠标事件本来就不生效，那三条会**无条件通过**（假绿，比没有断言更坏）。
+  // 顺序必须是“先 beta 后 alpha”：让一个页面进全屏会把**它自己**的指针锁定挤掉，
+  // 所以最后点的那一个才是可靠的。
+  const betaCaptured = await ensureCaptured(b.cdp, "beta");
+  if (betaCaptured) usedPointerLock = true;
+  const alphaStillCaptured = await ensureCaptured(a.cdp, "alpha");
+  if (alphaStillCaptured) usedPointerLock = true;
+  console.log(`  受害者（beta）已接管鼠标: ${betaCaptured}`);
+  await sleep(600);
+
   // 打倒对方。一杀定胜负，所以这一轮按住打完就该结算。
-  const burst = await fireBurst(a.cdp, 16, { watch: b.cdp });
+  //
+  // “打到就停” + 缩短收尾等待：倒地窗口只有 respawn_delay（3 秒），
+  // 早停一秒就多一秒余量来验证“两侧都看到他躺下”与“尸体不能再操作”。
+  const burst = await fireBurst(a.cdp, 20, {
+    watch: b.cdp,
+    stopWhen: (_s, w) => (w?.health ?? 100) <= 0,
+    settleMs: 120,
+  });
 
   // 击杀事件要走一趋中继，等两端都记上再断言。
   const scored = await waitFor(async () => {
@@ -1209,9 +1277,98 @@ async function checkScore() {
     const file = path.join(SHOT_DIR, "score-round-over.png");
     fs.writeFileSync(file, Buffer.from(img.data, "base64"));
     console.log(`  回合结算截图 ${file}`);
+    // 顺手放大屏幕中央：这时对手正躺在地上，而“躺着的样子”整屏看不清。
+    const vw = await a.cdp.evaluate("innerWidth");
+    const vh = await a.cdp.evaluate("innerHeight");
+    const cw = 200;
+    const ch = 150;
+    const zoom = await a.cdp.send("Page.captureScreenshot", {
+      format: "png",
+      clip: {
+        x: Math.round(vw / 2 - cw / 2), y: Math.round(vh / 2 - ch * 0.6),
+        width: cw, height: ch, scale: 4,
+      },
+    });
+    const zoomFile = path.join(SHOT_DIR, "score-round-over-zoom.png");
+    fs.writeFileSync(zoomFile, Buffer.from(zoom.data, "base64"));
+    console.log(`  倒地放大截图 ${zoomFile}`);
   }
 
+  // --- 倒地状态：两侧都得看到他躺下，而且倒地期间不能再操作 ---
+  //
+  // 这一段完全靠“杀掉 beta 之后那 3 秒”完成。四个断言各自对应一个真实现象：
+  //   - 开枪方看得到替身躺下（之前替身一直站着，用户报的就是这个）
+  //   - 被打者自己看得到自己躺下
+  //   - 倒地期间还能转视角（用户报的另一个：尸体还能转头）
+  //   - 倒地期间不能开火 / 不能移动
+  //
+  // 等“他真的死了”这个**事实**，再给倒下动画留出一段时间后才断言。
+  //
+  // 判据用受害者自己的 alive 标志，而不是**待测的**倒地动画：若用 "fall > 0.9" 作为
+  // 判据，一旦倒地姿态或同步坏了就会等超时，越过 3 秒重生窗口，
+  // 于是后面几条会拿着一个“已经复活的人”去断言，失败原因也变味。
+  const died = await waitFor(async () => {
+    const sb = await readStat(b.cdp);
+    return sb?.alive === false ? sb : null;
+  }, 4_000, 100);
+  if (died) await sleep(350);   // 倒下动画约 0.22 秒走完
+  const down = { sa: await readStat(a.cdp), sb: await readStat(b.cdp) };
+  const fallPeer = down.sa?.avatarFall?.[String(idB)] ?? -1;
+  const fallSelf = down.sb?.figure?.fall ?? -1;
+  const peerAliveFlag = down.sa?.peerAlive?.[String(idB)] ?? null;
+  const stillDead = died !== null && down.sb?.alive === false;
+  const deadRound = down.sa?.match?.round ?? 0;
+  // 这一条是那三条“不能操作”断言的前提：没接管时它们会假绿。
+  const corpseCaptured = down.sb?.mouseCaptured === true;
+
+  // 倒地期间一口气发三样输入：转视角（鼠标移动）、前进（W）、开火（左键）。
+  // 合在一起是为了省那三秒窗口——每多睡一段都可能撞上重生。
+  //
+  // 这里刻意**不用 mouseDelta()**：它每段之间睡 40 毫秒、结尾还多睡 300 毫秒，
+  // 合起来要 580 毫秒，而这个窗口一共只有 3 秒（还要留给出错排查）。
+  const yawBeforeCorpse = down.sb?.figure?.bodyYawDeg ?? 0;
+  const posBeforeCorpse = (down.sb?.pos ?? [0, 0, 0]).slice();
+  const shotsBeforeCorpse = down.sb?.shots ?? 0;
+  await keyDown(b.cdp, "KeyW");
+  await cdpFire(b.cdp, true);
+  // 鼠标 x 必须**单向**变化：指针锁定下是按相邻 x 之差的累积量转向的，
+  // 来回移动会让总位移抵消，于是“转了又转回来”读出来还是 0°——
+  // 那会让这条断言变成假绿（实测踩过一次：5 次移动净位移恰好为 0）。
+  // 先对齐到上一次的位置（640，就是点击接管那一下），再一路向左。
+  await b.cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseMoved", x: 640, y: 360, buttons: 0,
+  });
+  for (let i = 1; i <= 6; i++) {
+    await b.cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: 640 - i * 70, y: 360, buttons: 0,
+    });
+    await sleep(30);
+  }
+  await sleep(250);
+  const corpse = await readStat(b.cdp);
+  await cdpFire(b.cdp, false);
+  await keyUp(b.cdp, "KeyW");
+  const corpseYawDrift = Math.abs(angleDiff(corpse?.figure?.bodyYawDeg ?? 0, yawBeforeCorpse));
+  const corpseMoveDist = flatDist(corpse?.pos ?? [0, 0, 0], posBeforeCorpse);
+  const corpseShots = (corpse?.shots ?? 0) - shotsBeforeCorpse;
+  // 读数时他必须**仍然**倒地：否则下面三条会因为“他已经复活了”而失败，
+  // 那是测试太快/太慢的问题，不是游戏的问题。
+  const corpseStillDead = corpse?.alive === false;
+
   // 结算期间故意离开出生点：不这样的话，“重置把人送回出生点”本来就成立，验了等于没验。
+  //
+  // 【它必须在“等复活”之前做】本轮有两个时间窗口互相竞争：倒地窗口（死亡后 3 秒，
+  // 用来验尸体）与结算窗口（回合结束前 4.5 秒，用来验“重置把人拉回出生点”）。
+  // 先等复活再移动的话，“移动”会落到回合重置**之后**——那时人已经被送回出生点，
+  // 于是他会从出生点再走开一段，“重置把人送回出生点”就会被误判为失败（实测 6.13 米）。
+  //
+  // 【前提】上面给 beta 发的真实鼠标按下会让 **beta 的页面**去请求全屏 + 指针锁定，
+  // 而这会把 alpha 的指针锁定挤掉（实测：移动只剩 1.07 米、转身 0°，
+  // 因为没接管时键盘与鼠标事件根本不生效）。所以先把它拿回来，
+  // 并把“拿回来了”本身当成一条断言——否则后面的移动/转身断言会变成假失败。
+  const recaptured = await ensureCaptured(a.cdp, "alpha");
+  await sleep(300);
+
   await keyDown(a.cdp, "KeyD");
   await mouseDelta(a.cdp, 260);
   await sleep(500);
@@ -1221,15 +1378,34 @@ async function checkScore() {
   const movedDist = movedA ? flatDist(movedA.pos, spawnA) : 0;
   const turnedDeg = movedA ? Math.abs(angleDiff(movedA.figure.bodyYawDeg, spawnYawA)) : 0;
 
+  // 复活：应当回到站姿，而且**还在本回合内**（回合重置也会顺带把人扶起来，
+  // 那样就分不清是“重生”还是“被重置扶起来的”，所以额外要求 round 没变）。
+  const stood = await waitFor(async () => {
+    const sa = await readStat(a.cdp);
+    const sb = await readStat(b.cdp);
+    const upA = (sa?.avatarFall?.[String(idB)] ?? 1) < 0.1;
+    const upB = (sb?.figure?.fall ?? 1) < 0.1;
+    return (upA && upB) ? { sa, sb } : null;
+  }, 6_000, 200);
+  const stoodRound = stood?.sa?.match?.round ?? -1;
+  const stoodFallPeer = stood?.sa?.avatarFall?.[String(idB)] ?? -1;
+  const stoodFallSelf = stood?.sb?.figure?.fall ?? -1;
+
   // 等下一回合：比分清零、回合号 +1、人回到出生点
   const reset = await waitFor(async () => {
     const sa = await readStat(a.cdp);
     const sb = await readStat(b.cdp);
     return sa?.match?.round === 2 && sb?.match?.round === 2 ? { sa, sb } : null;
   }, 25_000, 250);
+  // 检测到 round=2 之后**再等一拍重新采样**：快照是每 0.25 秒发布一次的，
+  // 而“回合号 +1”与“把人摆回出生点”虽然在同一帧里，读到的仍可能是
+  // “回合号已变、位置还没变”的那个发布。重新采样一次最稳当。
+  await sleep(500);
+  const resetA = await readStat(a.cdp);
+  const resetB = await readStat(b.cdp);
 
-  const a2 = reset?.sa;
-  const b2 = reset?.sb;
+  const a2 = resetA ?? reset?.sa;
+  const b2 = resetB ?? reset?.sb;
   const limit = ready.sa.match.scoreLimit;
   const posBack = a2 ? flatDist(a2.pos, spawnA) : 999;
   const yawBack = a2 ? Math.abs(angleDiff(a2.figure.bodyYawDeg, spawnYawA)) : 999;
@@ -1257,6 +1433,24 @@ async function checkScore() {
       `记分板 "${introScoreboard}"`],
     ["击倒对方后自己记上一杀", (overScoresA[String(idA)]?.kills ?? 0) === 1,
       `alpha(${nameA}) 记 ${overScoresA[String(idA)]?.kills ?? "-"} 杀，beta 最低血量 ${burst.minHealth}`],
+    ["倒地后对方看得到他躺下", stillDead && fallPeer > 0.9,
+      `对方替身倒地程度 ${fallPeer.toFixed(2)}（0 站、1 躺）；同步过来的存活标志 peerAlive=${peerAliveFlag}`],
+    ["倒地后自己也看得到自己躺下", stillDead && fallSelf > 0.9,
+      `本端倒地程度 ${fallSelf.toFixed(2)}，本人生死标志 alive=${down.sb?.alive ?? null}`],
+    ["倒地期间不能转视角（用户报的那一项）", corpseStillDead && corpseYawDrift < 3.0,
+      `倒地期间鼠标横移 300 像素，朝向只变了 ${corpseYawDrift.toFixed(1)}°（读数时 alive=${corpse?.alive ?? null}、round=${deadRound}）`],
+    ["倒地期间不能移动", corpseStillDead && corpseMoveDist < 0.2,
+      `按住 W 之后位移 ${corpseMoveDist.toFixed(2)} 米`],
+    ["倒地期间不能开枪", corpseStillDead && corpseShots === 0,
+      `按住左键多打了 ${corpseShots} 发`],
+    ["倒地检查是在“他仍倒地且已接管鼠标”下做的（否则上面三条是假绿）",
+      corpseStillDead && corpseCaptured,
+      `读数时 alive=${corpse?.alive ?? null}、mouseCaptured=${down.sb?.mouseCaptured ?? null}`],
+    ["复活后两侧都重新站起来（本回合内）", stood !== null && stoodRound === deadRound,
+      `替身倒地程度 ${stoodFallPeer.toFixed(2)} / 本端 ${stoodFallSelf.toFixed(2)}，round=${stoodRound}`],
+    ["结算期间的移动是有意义的（先确认已接管鼠标）", recaptured,
+      "给 beta 发过真实鼠标按下，它会让 beta 去抢全屏与指针锁定，从而把 alpha 挤掉；"
+      + "不先拿回来，后面的“移动了/转身了”都会变成假失败"],
     ["被打的人记上一次阵亡", (overScoresA[String(idB)]?.deaths ?? 0) === 1,
       `beta(${nameB}) 记 ${overScoresA[String(idB)]?.deaths ?? "-"} 次阵亡`],
     ["两端对同一份比分看法一致",

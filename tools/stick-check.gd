@@ -312,6 +312,47 @@ func _part_radius(mesh: Mesh) -> float:
 	return -1.0
 
 
+## 倒地姿态：给 dead=true 会真的躺下（绕 X 轴 85°），给回 false 又会站起来。
+##
+## 三个点各守一件事：
+##   - 倒下要**平滑**（一帧不该直接躺平），否则看起来像瞬移
+##   - 躺下后角度要接近设定的 FALL_TILT_DEG（约 85°，不是 0 也不是 180）
+##   - 站起来要能回 0（否则重生后角色还是歪的）
+func _check_fall(fig: Node) -> void:
+	# 注意 `fig` 在这里是 Node，所以它的方法返回 Variant —— 赋给 := 会推断失败，
+	# 必须写显式类型（这是 --script 模式的老问题，见 AGENTS.md）。
+	var tilt := float(StickFigureScript.FALL_TILT_DEG)
+	# 先确保从站姿开始
+	for i in 30:
+		fig.animate(0.0, true, 1.0 / 60.0, 0.0, false)
+	var standing := float(fig.call("fall_amount"))
+
+	# 一帧之内不应该躺平（FALL_RATE 是每秒的比例，60 帧下每帧不到 0.1）
+	fig.animate(0.0, true, 1.0 / 60.0, 0.0, true)
+	var after_one_frame := float(fig.call("fall_amount"))
+
+	# 跑够时间让它躺下
+	for i in 60:
+		fig.animate(0.0, true, 1.0 / 60.0, 0.0, true)
+	var lying := float(fig.call("fall_amount"))
+	var tilt_deg := rad_to_deg(absf(fig.rotation.x))
+
+	# 站起来
+	for i in 60:
+		fig.animate(0.0, true, 1.0 / 60.0, 0.0, false)
+	var risen := float(fig.call("fall_amount"))
+	var risen_deg := rad_to_deg(absf(fig.rotation.x))
+
+	_check(standing < 0.01, "站姿下倒地程度为 0", "%.3f" % standing)
+	_check(after_one_frame < 0.2, "倒下是平滑的（一帧不会直接躺平）",
+		"一帧后 %.3f（FALL_RATE=%.1f）" % [after_one_frame, StickFigureScript.FALL_RATE])
+	_check(lying > 0.95, "持续倒地会完全躺下", "倒地程度 %.3f" % lying)
+	_check(absf(tilt_deg - tilt) < 3.0, "躺下的角度符合设计",
+		"%.1f°（设计 %.1f°）" % [tilt_deg, tilt])
+	_check(risen < 0.01 and risen_deg < 1.0, "不再倒地时会站起来",
+		"倒地程度 %.3f、角度 %.2f°" % [risen, risen_deg])
+
+
 ## 检查骨头默认姿态下的世界高度。
 ##
 ## 这一项是补上的：只设 rest 不设 pose 时，所有骨头都会堆在骨骼原点，
@@ -529,6 +570,12 @@ func _run_checks() -> void:
 	# 取模：传超出范围的序号不应该崩
 	fig.apply_style(7)
 	_check(fig.style_name() == name_b, "样式序号按数量取模", fig.style_name())
+
+	# --- 倒地姿态 ---
+	# 这是“被击倒后要躺下”那个报障的最小验证：姿态完全由 dead 标志派生，
+	# 所以先在这里验数学（快、无网），联机侧另验“这个标志真的传过去了”。
+	fig.apply_style(0)
+	_check_fall(fig)
 
 	# --- 步态：走起来关节必须动 ---
 	fig.apply_style(0)
