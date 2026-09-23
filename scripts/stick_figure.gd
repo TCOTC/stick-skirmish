@@ -23,6 +23,9 @@ extends Node3D
 ##   - 肩横杆：把两条手臂连到躯干
 ##   - 关节球：肢体一转动，两段圆柱的接缝处会裂开一个 V 形缝，用小球填住
 ##
+## 持枪（`equip_gun`）：枪挂在右手骨头上，右臂摆出**持枪姿态**（`_aim_arm_rotation`）。
+## 关键在于手臂要**反向补偿身体偏转**，否则枪口会跟着偏身歪掉、与准星不再一致。
+##
 ## 坐标约定：脚本节点的原点是**脚底**，与 CharacterBody3D 的碰撞胶囊底部对齐。
 
 ## 两套样式的差异都在这里。radius 是细杆半径：火柴人靠“细线 + 关节”辨识，
@@ -69,18 +72,21 @@ const HIP_X := 0.09
 #
 # spine 的原点与 hips 重合（都放在骨盆），不是为了省节点，而是让躯干前倾围绕**骨盆**旋转：
 # 原点若设在躯干中段，前倾时下半截会向后甩，与骨盆、大腿之间裂开约 3.5 厘米的缝。
+#
+# 左右的符号约定：角色面朝 -Z，所以**角色右侧是 +X**（右手方向 = 前方 × 上方）。
+# 所以 *_l 取负、*_r 取正，与眼部命名（eye_l 在 -X）保持一致。
 const BONES: Array = [
 	["hips", "", Vector3(0.0, HIPS_HEIGHT, 0.0)],
 	["spine", "hips", Vector3(0.0, 0.0, 0.0)],
 	["neck", "spine", Vector3(0.0, SPINE_LEN, 0.0)],
 	["head", "neck", Vector3(0.0, NECK_LEN, 0.0)],
-	["upper_arm_l", "neck", Vector3(SHOULDER_X, 0.0, 0.0)],
+	["upper_arm_l", "neck", Vector3(-SHOULDER_X, 0.0, 0.0)],
 	["lower_arm_l", "upper_arm_l", Vector3(0.0, -UPPER_ARM_LEN, 0.0)],
-	["upper_arm_r", "neck", Vector3(-SHOULDER_X, 0.0, 0.0)],
+	["upper_arm_r", "neck", Vector3(SHOULDER_X, 0.0, 0.0)],
 	["lower_arm_r", "upper_arm_r", Vector3(0.0, -UPPER_ARM_LEN, 0.0)],
-	["upper_leg_l", "hips", Vector3(HIP_X, 0.0, 0.0)],
+	["upper_leg_l", "hips", Vector3(-HIP_X, 0.0, 0.0)],
 	["lower_leg_l", "upper_leg_l", Vector3(0.0, -UPPER_LEG_LEN, 0.0)],
-	["upper_leg_r", "hips", Vector3(-HIP_X, 0.0, 0.0)],
+	["upper_leg_r", "hips", Vector3(HIP_X, 0.0, 0.0)],
 	["lower_leg_r", "upper_leg_r", Vector3(0.0, -UPPER_LEG_LEN, 0.0)],
 ]
 
@@ -154,6 +160,21 @@ var _amp := 0.0
 var _air := 0.0
 var _built := false
 
+# 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
+const GunScript := preload("res://scripts/gun.gd")
+
+## 持枪姿态用到的俯仰（弧度）。由 player.gd 每帧写入，取自镜头。
+## 不带上它的话枪管会水平前伸，而子弹是沿带俯仰的镜头方向飞的，两者不一致。
+var aim_pitch := 0.0
+
+## 手里的枪。没装备时为 null。
+##
+## 类型故意留空（不写 `Gun`）：headless 与 `--script` 模式不写全局类缓存，
+## 写成 `var gun: Gun` 会连带把引用它的脚本也弄成 “Could not resolve external class member”。
+## 留空之后是 Variant，调用 `gun.flash()` 这类是动态解析，两种模式都正常。
+var gun = null
+var _gun_equipped := false
+
 
 func _ready() -> void:
 	build()
@@ -186,15 +207,50 @@ func bone_angle(bone_name: String) -> float:
 	return _skeleton.get_bone_pose_rotation(idx).get_euler().x
 
 
+## 装备枪。右臂会随之摆出持枪姿态（见 animate）。
+## 配色取自当前样式，所以换样式重建时会自动跟着变。
+func equip_gun() -> void:
+	_gun_equipped = true
+	_attach_gun()
+
+
+## 枪口的世界位置。曳光起点与射线起点都用它。
+func muzzle_position() -> Vector3:
+	return gun.muzzle_position() if gun != null else global_position
+
+
+## 枪口指向（世界坐标）。应当恒等于角色前方，与身体偏转无关——自检会核对。
+func muzzle_forward() -> Vector3:
+	return gun.muzzle_forward() if gun != null else -global_transform.basis.z
+
+
+func _attach_gun() -> void:
+	gun = null
+	if not _gun_equipped or _limb_mat == null:
+		return
+	var g = GunScript.new()
+	g.name = "Gun"
+	# 先入树再设位置：入树之后全局变换才成立
+	_attach("lower_arm_r").add_child(g)
+	g.position = Vector3(0.0, -LOWER_ARM_LEN, 0.0)   # 握在手的位置
+	g.build(_limb_mat.albedo_color)
+	gun = g
+
+
 func limb_color() -> Color:
 	return _limb_mat.albedo_color if _limb_mat != null else Color.BLACK
 
 
 func _rebuild() -> void:
-	# 先摘掉旧节点再重建：remove_child 立即生效，queue_free 只是延迟释放。
-	for child in get_children():
-		remove_child(child)
-		child.queue_free()
+	# 只拆掉自己建的骨骼（枪挂在骨骼下面，会跟着一起去）。
+	# **不要**遍历子节点全删：外部会在角色节点上挂东西（联机侧挂了命中框与头顶血条），
+	# 全删会把它们一起清掉，而且症状很隐蔽——字典里存的对象变成 null，
+	# 只表现为“画面上看不到”，查找起来很费劲。
+	if _skeleton != null and is_instance_valid(_skeleton):
+		remove_child(_skeleton)
+		_skeleton.queue_free()
+	_skeleton = null
+	gun = null
 	_bones.clear()
 
 	var style: Dictionary = STYLES[style_index]
@@ -242,6 +298,10 @@ func _rebuild() -> void:
 
 	if bool(style["chest_band"]):
 		_add_chest_band(radius)
+
+	# 样式重建会把旧子节点全部丢掉，也包括枪，所以要重新挂一支。
+	if _gun_equipped:
+		_attach_gun()
 
 
 ## 取某根骨头的附件节点，没有就建一个。
@@ -415,9 +475,39 @@ func animate(move_speed: float, grounded: bool, delta: float) -> void:
 	_set_rot("spine", lean)
 	_set_rot("hips", 0.0)
 
+	if gun != null:
+		# 持枪：右臂抬到正前方、肘部伸直，让枪口对准准星。
+		# 左臂照旧摆动，这样走路姿态还能看得出来。
+		_set_rot_quat("upper_arm_r", _aim_arm_rotation(lean))
+		_set_rot("lower_arm_r", 0.0)
+
 	var hips_idx: int = _bones.get("hips", -1)
 	if hips_idx >= 0:
 		_skeleton.set_bone_pose_position(hips_idx, Vector3(0.0, HIPS_HEIGHT + bob, 0.0))
+
+
+## 持枪时右臂的旋转：让手臂（本来沿 -Y 向下）对准**子弹飞行的方向**。
+##
+## 要抵消/叠加的旋转有三级，漏掉任何一级枪口都会歪：
+##   - 镜头的俯仰 `aim_pitch`（目标方向本身就带这个角）
+##   - 角色自身绕 Y 的偏身：`rotation.y`（方向键导致，最大 lean_deg）
+##   - 躯干绕 X 的前倾：`spine_lean`（步态导致，走路时一直存在）
+## 手臂的父级链累积起来就是 `Ry(rotation.y)·Rx(spine_lean)`，取其逆作用到目标方向上。
+##
+## 用“把 -Y 转到目标方向”的最小旋转来求，而不是手写欧拉角：欧拉顺序记错就会差 90°，
+## 而且躯干前倾那一级很难手算。自检里那项“枪口对准飞行方向”会验证结果。
+func _aim_arm_rotation(spine_lean: float) -> Quaternion:
+	# 镜头在 Player 空间里绕 X 转了 aim_pitch，所以前方是 (0, sin, -cos)
+	var target := Vector3(0.0, sin(aim_pitch), -cos(aim_pitch))
+	target = Basis(Vector3.RIGHT, -spine_lean) * Basis(Vector3.UP, -rotation.y) * target
+	return Quaternion(Vector3(0.0, -1.0, 0.0), target)
+
+
+func _set_rot_quat(bone_name: String, quat: Quaternion) -> void:
+	var idx: int = _bones.get(bone_name, -1)
+	if idx < 0:
+		return
+	_skeleton.set_bone_pose_rotation(idx, quat)
 
 
 func _set_rot(bone_name: String, x: float) -> void:

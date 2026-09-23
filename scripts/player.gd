@@ -26,8 +26,18 @@ extends CharacterBody3D
 @export_range(0.0, 89.0, 1.0) var lean_deg: float = 45.0
 ## 偏转的逼近速度，越大转得越快。
 @export var lean_rate: float = 12.0
+## 两发之间的最短间隔（秒）。0.11 ≈ 9 发/秒。
+@export var fire_rate: float = 0.11
+## 命中一发的伤害。100 血 = 三发倒。
+@export var bullet_damage: int = 34
+@export var max_range: float = 200.0
+## 倒地后多久重生（秒）。
+@export var respawn_delay: float = 3.0
+## 刚接管鼠标后这段时间内不开火：那一次点击是用来锁定指针的，不该顺手打出一发。
+const FIRE_BLOCK_AFTER_CAPTURE := 0.25
 
 @onready var _arm: SpringArm3D = $SpringArm
+@onready var _camera: Camera3D = $SpringArm/Camera3D
 
 const MOVE_ACTIONS := ["move_forward", "move_back", "move_left", "move_right", "jump"]
 
@@ -40,6 +50,19 @@ var _gravity: float = 24.0
 # 光标还露在外面（还没点进游戏，或者刚按了 Esc）就不该能操作。
 var _input_active := false
 
+# --- 战斗状态 ---------------------------------------------------------------
+var max_health := 100
+var health := 100
+var alive := true
+var _fire_cd := 0.0
+var _fire_block := 0.0
+var _respawn_left := 0.0
+# 已开火次数。供自动化检查确认“真的打出去了”。
+var shots_fired := 0
+# 出生点由 net.gd 在错开位置后告知（见 set_spawn_point）
+var _spawn_pos := Vector3.ZERO
+var _spawn_known := false
+
 ## 火柴人外观。样式（两套之一）由 net.gd 按进入房间的顺序决定。
 var figure: StickFigureScript = null
 
@@ -49,6 +72,13 @@ func _ready() -> void:
 	_gravity = float(ProjectSettings.get_setting("physics/3d/default_gravity", 9.8))
 	_arm.rotation.x = _pitch
 	_build_figure()
+	if figure != null:
+		figure.equip_gun()
+	_spawn_pos = global_position
+	_spawn_known = true
+	# 延后一帧再推血量：HUD 在场景里排在 Player 之后，此刻它还没进 group("hud")，
+	# 立即推送会找不到它，血量文字就一直是空的。
+	_update_hud.call_deferred()
 	# 注意：不要在这里抢鼠标锁定。浏览器要求 pointer lock 必须由用户手势触发，
 	# 否则会抛 WrongDocumentError；玩家第一次点击时再接管（见 _unhandled_input）。
 	print("[player] ready pos=", global_position)
@@ -93,8 +123,24 @@ func _physics_process(delta: float) -> void:
 	var active := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
 	if active != _input_active:
 		_input_active = active
-		if not active:
+		if active:
+			# 接管鼠标的那一下点击不要顺手打出一发
+			_fire_block = FIRE_BLOCK_AFTER_CAPTURE
+		else:
 			_stop_moving()
+
+	_fire_cd = maxf(0.0, _fire_cd - delta)
+	_fire_block = maxf(0.0, _fire_block - delta)
+
+	if not alive:
+		_tick_respawn(delta)
+		# 倒地时不能让旧速度留着，否则尸体会滑行
+		velocity.x = 0.0
+		velocity.z = 0.0
+		if not is_on_floor():
+			velocity.y -= _gravity * delta
+		move_and_slide()
+		return
 
 	var want := Vector2.ZERO
 	if active:
@@ -113,7 +159,12 @@ func _physics_process(delta: float) -> void:
 
 	# 步态用水平速度驱动：走快摆幅大、停下回直立、离地换空中姿势。
 	if figure != null:
+		# 持枪姿态要跟着镜头俯仰，否则枪口与子弹方向不一致
+		figure.aim_pitch = _pitch
 		figure.animate(Vector2(velocity.x, velocity.z).length(), is_on_floor(), delta)
+
+	if active and _fire_block <= 0.0 and Input.is_action_pressed("fire"):
+		_try_fire()
 
 
 ## 身体随方向键偏转一点，**不超过 lean_deg**。镜头不跟随这个偏转。
@@ -156,6 +207,168 @@ func facing_yaw() -> float:
 ## 留这个访问器是为了让自动化检查能断言这一点。
 func camera_offset_yaw() -> float:
 	return _arm.rotation.y if _arm != null else 0.0
+
+
+# --- 射击 -------------------------------------------------------------------
+
+## 子弹的世界起点。取枪口而不是相机：从相机出发的射线要先穿过自己的身体。
+func aim_origin() -> Vector3:
+	if figure != null and figure.gun != null:
+		return figure.muzzle_position()
+	return global_position
+
+
+## 镜头俯仰（弧度）。同步出去是为了让替身的枪口角度与对方一致。
+func aim_pitch() -> float:
+	return _pitch
+
+
+## 子弹方向（单位向量）。它由**相机射线打到哪**决定，而不是直接取相机朝向。
+##
+## 这样做的原因：枪口在身体前方、相机的瞄准点在屏幕中心，两者有视差；
+## 若直接沿相机朝向发射，近距离时子弹会偏离准星所指的目标。
+## 改成“先算相机射线命中点，再从枪口朝那个点发射”，准星指哪就打哪。
+func aim_direction() -> Vector3:
+	var from := _camera.global_position
+	var dir := -_camera.global_transform.basis.z
+	var hit := _raycast(from, dir, [self])
+	var point := from + dir * max_range
+	if not hit.is_empty():
+		point = hit["position"]
+	return (point - aim_origin()).normalized()
+
+
+func _try_fire() -> void:
+	# 冷却判断放在这里而不是调用处：只有一个入口，其他地方想加“顺手开一枪”也绕不过射速。
+	if not alive or figure == null or figure.gun == null:
+		return
+	if _fire_cd > 0.0:
+		return
+	_fire_cd = fire_rate
+	shots_fired += 1
+
+	var from := _camera.global_position
+	var dir := -_camera.global_transform.basis.z
+	var hit := _raycast(from, dir, [self])
+	var point := from + dir * max_range
+	if not hit.is_empty():
+		point = hit["position"]
+
+	var muzzle := figure.muzzle_position()
+	figure.gun.flash()
+	Fx.tracer(muzzle, point, figure.limb_color())
+	if not hit.is_empty():
+		Fx.impact(hit["position"], hit["normal"], figure.limb_color())
+
+	# 广播的是“枪口 + 朝向命中点的方向”，这样远端用同一条射线重放，
+	# 既不会有视差，也不会从自己的身体里穿出去。
+	if Net.connected:
+		Net.broadcast_fire(muzzle, (point - muzzle).normalized())
+
+
+## 收到别人开火。**由被打中的人判定命中**（本函数在被打者的客户端运行）。
+##
+## 为什么不用射击方判定：射击方手上的目标位置是 20 Hz 同步过来的、有延迟的旧数据，
+## 8 m/s 时误差可达 40 厘米；由被打者用**自己当前位置**判定才准。
+## 代价是打人的人可能看到“明明打中却掉血”，这是没有延迟补偿时的必然取舍。
+func receive_shot(origin: Vector3, direction: Vector3, damage: int) -> bool:
+	if not alive:
+		return false
+	var hit := _raycast(origin, direction, [])
+	if hit.is_empty():
+		return false
+	# 只认打中自己的身体。被掩体或别人挡住时，第一个命中就不是我。
+	if hit["collider"] != self:
+		return false
+	take_damage(damage)
+	return true
+
+
+func take_damage(amount: int) -> void:
+	if not alive:
+		return
+	health = maxi(0, health - amount)
+	_update_hud()
+	if Net.connected:
+		Net.broadcast_health(health)
+	if health <= 0:
+		_die()
+
+
+## 让 net.gd 在错开出生位置之后告知出生点，重生时用。
+func set_spawn_point(pos: Vector3) -> void:
+	_spawn_pos = pos
+	_spawn_known = true
+
+
+func _die() -> void:
+	alive = false
+	_respawn_left = respawn_delay
+	velocity = Vector3.ZERO
+	if figure != null:
+		# 侧倒：绕 X 倒下去（figure 的 rotation.y 由 _update_lean 改，x 是空闲的）
+		figure.rotation.x = deg_to_rad(85.0)
+	print("[player] 倒地")
+
+
+func _tick_respawn(delta: float) -> void:
+	_respawn_left -= delta
+	_set_hud_down(maxf(0.0, _respawn_left))
+	if _respawn_left > 0.0:
+		return
+	respawn()
+
+
+func respawn() -> void:
+	health = max_health
+	alive = true
+	_respawn_left = 0.0
+	if _spawn_known:
+		global_position = _spawn_pos
+	velocity = Vector3.ZERO
+	if figure != null:
+		figure.rotation.x = 0.0
+	_update_hud()
+	_set_hud_down(0.0)
+	if Net.connected:
+		Net.broadcast_health(health)
+	print("[player] 重生 at ", global_position)
+
+
+## 一次射线查询。exclude 传自己要排除的节点。
+## 用它统一处理「打中掩体」与「打中角色」两种情况，掩体后的人自然打不到。
+func _raycast(origin: Vector3, direction: Vector3, exclude: Array) -> Dictionary:
+	var space := get_world_3d().direct_space_state
+	if space == null:
+		return {}
+	var query := PhysicsRayQueryParameters3D.create(
+		origin, origin + direction.normalized() * max_range
+	)
+	query.exclude = exclude
+	query.collide_with_areas = false
+	return space.intersect_ray(query)
+
+
+# --- HUD 通信 ---------------------------------------------------------------
+
+## HUD 在 group("hud") 里注册自己，这里按需取，不持有强引用。
+func _hud() -> Node:
+	var tree := get_tree()
+	if tree == null:
+		return null
+	return tree.get_first_node_in_group("hud")
+
+
+func _update_hud() -> void:
+	var hud := _hud()
+	if hud != null:
+		hud.call("set_health", health, max_health)
+
+
+func _set_hud_down(seconds: float) -> void:
+	var hud := _hud()
+	if hud != null:
+		hud.call("set_down", seconds)
 
 
 func _notification(what: int) -> void:

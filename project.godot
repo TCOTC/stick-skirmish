@@ -15,6 +15,9 @@ config/icon="res://icon.svg"
 
 [autoload]
 
+; 短命的视觉特效（曳光、弹着点）。只在本机播放，不参与同步。
+Fx="*res://scripts/fx.gd"
+
 ; 联机：每个客户端广播自己的位置，并为其他玩家画替身（见 scripts/net.gd）。
 Net="*res://scripts/net.gd"
 

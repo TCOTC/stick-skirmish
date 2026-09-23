@@ -9,15 +9,20 @@ extends Node
 ## 同一台机器开两个标签页也能看到替身，可以单独验证同步。
 ##
 ## 局限（这是"先跑起来看看"，不是成品）：
-##   - 替身没有碰撞，走过对方身体不会撞到
 ##   - 没有插值补偿，网络抖动大时会看到远端瞬移（只有位置平滑）
 ##   - 断线不重连，对端离开靠超时判定
-##   - 只同步位置与朝向，没有射击、血量、计分
+##   - 命中的判定权在**被打中的人**那边，对方网络卡顿时会漏判（没有延迟补偿）
 
 const TICK := 0.05          # 20 Hz 广播自身状态
 const PEER_TIMEOUT := 2.0   # 超过这么久没收到就认为对方走了
 const SMOOTH_RATE := 14.0   # 替身位置平滑速度
 const PUBLISH_INTERVAL := 0.25  # 供自动化检查读取的间隔
+const FIRE_RANGE := 200.0   # 复现别人弹道时的射线长度
+const DEFAULT_MAX_HP := 100
+
+# 替身放在第 3 碰撞层：**只给射线用，不做物理阻挡**。
+# 默认碰撞层是 1，走到一起会互相卡住；而射线默认掩码包含所有层，所以曳光能停在替身上。
+const AVATAR_COLLISION_LAYER := 3
 
 const SPAWN_Z := 9.0
 const SPAWN_X_OFFSET := 3.0
@@ -26,6 +31,7 @@ const GROUND_Y_MAX := 0.3
 
 # 用 preload 而不是全局类名：headless 与 --script 模式不会写 .godot 里的全局类缓存。
 const StickFigureScript := preload("res://scripts/stick_figure.gd")
+const HealthBarScript := preload("res://scripts/health_bar_3d.gd")
 
 var my_id := 0
 var connected := false
@@ -48,6 +54,8 @@ var _targets: Dictionary = {}
 var _avatars: Dictionary = {}
 # 编号 → 已应用的样式序号（变了才重建外观）
 var _avatar_ranks: Dictionary = {}
+# 编号 → 替身头顶的血条
+var _avatar_bars: Dictionary = {}
 
 
 func _ready() -> void:
@@ -144,7 +152,12 @@ func _on_connected() -> void:
 		return
 	# 两个玩家都从 (0, 1, 9) 出生会完全重叠，按编号奇偶错开。
 	_player.global_position.x += SPAWN_X_OFFSET if (my_id % 2 == 0) else -SPAWN_X_OFFSET
-	print("[net] 出生点 ", _player.global_position)
+	# 朝向对面：两人各偏 ±90°。默认都朝 -Z 的话开局看到的是墙，而且正好背对对手。
+	_player.rotation.y = (PI * 0.5) if (my_id % 2 == 0) else (-PI * 0.5)
+	print("[net] 出生点 ", _player.global_position, " 朝向 ", rad_to_deg(_player.rotation.y))
+	# 告诉玩家出生点，重生时要用
+	if _player.has_method("set_spawn_point"):
+		_player.call("set_spawn_point", _player.global_position)
 	_refresh_styles()
 	# 无条件应用一次：_refresh_styles 只在「位次变了」时才会调它，
 	# 而位次是 0 时“没变”，于是初始化就依赖了“默认样式正好是 0 号”这个巧合。
@@ -170,7 +183,7 @@ func _send_state(delta: float) -> void:
 	# 广播：中继不做定向，rpc() 默认就是发给所有对端。
 	# 发的是**视觉朝向**（火柴人面朝哪边），不是 player.rotation.y（镜头朝向）：
 	# 本地火柴人跟着移动方向转，发镜头朝向的话双方看到的脸就不一致了。
-	rpc("_peer_state", my_id, _player.global_position, _visual_yaw())
+	rpc("_peer_state", my_id, _player.global_position, _visual_yaw(), _visual_pitch())
 
 
 ## 问玩家节点要当前的外观朝向。外观策略属于 player.gd，这里不自己拼 rotation.y。
@@ -182,9 +195,16 @@ func _visual_yaw() -> float:
 	return _player.rotation.y
 
 
+## 镜头俯仰。替身拿它摆枪口角度，不然对方的枪会一直平指。
+func _visual_pitch() -> float:
+	if _player != null and _player.has_method("aim_pitch"):
+		return float(_player.call("aim_pitch"))
+	return 0.0
+
+
 ## 收到的每个包都会被标成来自 1 号，所以发送者身份只能自己写在参数里。
 @rpc("any_peer", "call_remote")
-func _peer_state(id: int, pos: Vector3, yaw: float) -> void:
+func _peer_state(id: int, pos: Vector3, yaw: float, pitch: float) -> void:
 	if id == my_id or id <= 1:
 		return
 
@@ -202,6 +222,7 @@ func _peer_state(id: int, pos: Vector3, yaw: float) -> void:
 
 	entry["pos"] = pos
 	entry["yaw"] = yaw
+	entry["pitch"] = pitch
 	entry["at"] = now
 	entry["speed"] = speed
 	entry["grounded"] = pos.y < GROUND_Y_MAX
@@ -210,12 +231,14 @@ func _peer_state(id: int, pos: Vector3, yaw: float) -> void:
 	if first:
 		print("[net] 见到玩家 ", id)
 		_avatars[id] = _make_avatar(id, pos, yaw)
+		_add_avatar_body(_avatars[id])
+		_add_avatar_bar(id, _avatars[id])
 		_refresh_styles()
 
 
 ## 替身也是火柴人：脚底对齐玩家原点，所以位置不加偏移。
 func _make_avatar(id: int, pos: Vector3, yaw: float) -> Node3D:
-	var avatar: Node3D = StickFigureScript.new()
+	var avatar = StickFigureScript.new()
 	avatar.name = "Remote%d" % id
 
 	var scene := get_tree().current_scene
@@ -224,7 +247,35 @@ func _make_avatar(id: int, pos: Vector3, yaw: float) -> Node3D:
 	scene.add_child(avatar)
 	avatar.global_position = pos
 	avatar.rotation.y = yaw
+	# 入树后 build 已完成，才能挂枪（枪的配色取自样式材质）
+	avatar.equip_gun()
 	return avatar
+
+
+## 给替身加一个只有射线能碰到的碰撞体（见 AVATAR_COLLISION_LAYER 的说明）。
+## 没有它的话，射击方的曳光会直接穿过替身，看不出打没打中。
+func _add_avatar_body(avatar: Node3D) -> void:
+	var body := StaticBody3D.new()
+	body.name = "HitBox"
+	body.collision_layer = 1 << (AVATAR_COLLISION_LAYER - 1)
+	body.collision_mask = 0        # 不去碰别人，只被射线查
+	var col := CollisionShape3D.new()
+	var shape := CapsuleShape3D.new()
+	shape.radius = 0.4
+	shape.height = 1.8
+	col.shape = shape
+	# CollisionShape3D 必须是 CollisionObject3D 的直接子节点，中间夹一层就不注册
+	body.add_child(col)
+	body.position = Vector3(0.0, 0.9, 0.0)
+	avatar.add_child(body)
+
+
+func _add_avatar_bar(id: int, avatar: Node3D) -> void:
+	var bar = HealthBarScript.new()
+	bar.name = "HealthBar"
+	avatar.add_child(bar)
+	bar.set_health(DEFAULT_MAX_HP, DEFAULT_MAX_HP)
+	_avatar_bars[id] = bar
 
 
 ## 样式按“进入房间的顺序”分配。
@@ -292,6 +343,7 @@ func _expire_peers() -> void:
 	for id in gone:
 		_targets.erase(id)
 		_avatar_ranks.erase(id)
+		_avatar_bars.erase(id)
 		var avatar = _avatars.get(id)
 		if avatar != null:
 			avatar.queue_free()
@@ -309,6 +361,7 @@ func _smooth_avatars(delta: float) -> void:
 		var entry: Dictionary = _targets[id]
 		avatar.global_position = avatar.global_position.lerp(entry["pos"], weight)
 		avatar.rotation.y = lerp_angle(avatar.rotation.y, float(entry["yaw"]), weight)
+		avatar.aim_pitch = float(entry.get("pitch", 0.0))
 		avatar.animate(
 			float(entry.get("speed", 0.0)), bool(entry.get("grounded", true)), delta
 		)
@@ -340,6 +393,12 @@ func _publish() -> void:
 	for id in _avatar_ranks:
 		ranks[str(id)] = _avatar_ranks[id]
 
+	var own_health := DEFAULT_MAX_HP
+	if _player != null and "health" in _player:
+		own_health = int(_player.get("health"))
+
+	var head_screen_y := _head_screen_y()
+
 	var figure_info := {}
 	var figure := _my_figure()
 	if figure != null:
@@ -367,6 +426,27 @@ func _publish() -> void:
 	for id in _avatars:
 		avatar_yaw[str(id)] = snappedf(rad_to_deg(_avatars[id].rotation.y), 0.1)
 
+	# 替身的位置。射击检查要用它算出“该朝哪边转才能打到对方”。
+	var peer_pos := {}
+	for id in _targets:
+		var p: Vector3 = _targets[id]["pos"]
+		peer_pos[str(id)] = [snappedf(p.x, 0.01), snappedf(p.y, 0.01), snappedf(p.z, 0.01)]
+
+	var shots := 0
+	if _player != null and "shots_fired" in _player:
+		shots = int(_player.get("shots_fired"))
+
+	# 替身的装饰件（命中框、头顶血条）是否还在。
+	# 它们挂在替身节点下，而外观重建曾经会把子节点全删掉，把这两个一起吞了——
+	# 症状只是“画面上看不到”，所以宁可断言也不要靠看。
+	var decor := {}
+	for id in _avatars:
+		var avatar = _avatars[id]
+		decor[str(id)] = {
+			"hitBox": avatar.get_node_or_null("HitBox") != null,
+			"barOk": _avatar_bars.get(id) != null,
+		}
+
 	var snapshot := {
 		"room": room,
 		"url": url,
@@ -377,12 +457,48 @@ func _publish() -> void:
 		"status": status,
 		"peers": _targets.keys(),
 		"peerRanks": ranks,
+		"peerPos": peer_pos,
 		"avatars": _avatars.size(),
 		"avatarYawDeg": avatar_yaw,
+		"avatarDecor": decor,
 		"figure": figure_info,
 		"pos": [snappedf(pos.x, 0.01), snappedf(pos.y, 0.01), snappedf(pos.z, 0.01)],
+		"health": own_health,
+		"shots": shots,
+		"fx": _count_fx(),
+		"headScreenY": head_screen_y,
 	}
 	JavaScriptBridge.eval("window.__netstat = " + JSON.stringify(snapshot))
+
+
+## 角色头顶在屏幕上的纵向位置，0 是屏幕顶端、1 是底端。
+##
+## 用相机的 unproject 算，而不是靠眼看截图：取景要求是“角色落在画面下方、
+## 准星周围留出空间”，这是个可以断言的数值。看不到角色（-1）时检查会报出来。
+func _head_screen_y() -> float:
+	if _player == null:
+		return -1.0
+	var cam := _player.get_node_or_null("SpringArm/Camera3D") as Camera3D
+	if cam == null or not cam.is_inside_tree():
+		return -1.0
+	var head := _player.global_position + Vector3(0.0, 1.75, 0.0)
+	var vh := cam.get_viewport().get_visible_rect().size.y
+	if vh <= 0.0:
+		return -1.0
+	return snappedf(cam.unproject_position(head).y / vh, 0.01)
+
+
+## 场上还活着的特效节点数（曳光、弹着点）。用来确认开火真的产生了效果。
+func _count_fx() -> int:
+	var scene := get_tree().current_scene
+	if scene == null:
+		return 0
+	var n := 0
+	for child in scene.get_children():
+		var name := String(child.name)
+		if name.begins_with("Tracer") or name.begins_with("Impact"):
+			n += 1
+	return n
 
 
 func _style_name(rank: int) -> String:
@@ -395,3 +511,92 @@ func _cam_offset() -> float:
 	if _player != null and _player.has_method("camera_offset_yaw"):
 		return float(_player.call("camera_offset_yaw"))
 	return 0.0
+
+
+# --- 射击同步 ---------------------------------------------------------------
+
+## 告诉所有人“我开了一枪”。origin 是枪口，direction 是指向命中点的方向。
+func broadcast_fire(origin: Vector3, direction: Vector3) -> void:
+	if my_id <= 0:
+		return
+	rpc("_peer_fire", my_id, origin, direction)
+
+
+## 血量变化时告知所有人（包括自己被打倒后重生回满血）。
+func broadcast_health(hp: int) -> void:
+	if my_id <= 0:
+		return
+	rpc("_peer_health", my_id, hp)
+
+
+## 收到别人的枪声。做两件事：把这条弹道画出来，再让本地玩家判定自己有没有被打到。
+##
+## 判定交给本地玩家而不是射击方，理由见 player.gd 的 `receive_shot`。
+@rpc("any_peer", "call_remote")
+func _peer_fire(shooter_id: int, origin: Vector3, direction: Vector3) -> void:
+	if shooter_id == my_id or shooter_id <= 1:
+		return
+
+	var color := _peer_color(shooter_id)
+	var hit := _trace(origin, direction)
+	var end := origin + direction.normalized() * FIRE_RANGE
+	if not hit.is_empty():
+		end = hit["position"]
+	Fx.tracer(origin, end, color)
+	if not hit.is_empty():
+		Fx.impact(hit["position"], hit["normal"], color)
+
+	if _player != null and _player.has_method("receive_shot"):
+		# 伤害取**本地**配置：判定权在被击中的人这边，伤害量也一并归他管，
+		# 这样两端的“谁定结果”是同一个，不会一半在一个客户端、一半在另一个。
+		_player.call("receive_shot", origin, direction, int(_player.get("bullet_damage")))
+
+
+## 收到血量变化。打中提示就是从这里来的：看到别人的血真的掉了才算命中。
+@rpc("any_peer", "call_remote")
+func _peer_health(id: int, hp: int) -> void:
+	if id == my_id or id <= 1:
+		return
+	var entry: Dictionary = _targets.get(id, {})
+	var prev := int(entry.get("hp", DEFAULT_MAX_HP)) if entry.has("hp") else -1
+	entry["hp"] = hp
+	_targets[id] = entry
+
+	var bar = _avatar_bars.get(id)
+	if bar != null:
+		bar.set_health(hp, DEFAULT_MAX_HP)
+
+	# prev < 0 表示这是第一次收到他的血量（比如他刚重生上线），不算命中
+	if prev >= 0 and hp < prev:
+		var hud := _hud_node()
+		if hud != null:
+			hud.call("hitmarker")
+		print("[net] 打中玩家 ", id, " 剩余 ", hp)
+
+
+## 用玩家自己的世界做一次射线，取第一个命中（掩体也算）。
+func _trace(origin: Vector3, direction: Vector3) -> Dictionary:
+	if _player == null:
+		return {}
+	var space := _player.get_world_3d().direct_space_state
+	if space == null:
+		return {}
+	var query := PhysicsRayQueryParameters3D.create(
+		origin, origin + direction.normalized() * FIRE_RANGE
+	)
+	return space.intersect_ray(query)
+
+
+## 射手样式的颜色，用来给曳光与弹着点上色，方便分辨是谁打的。
+func _peer_color(id: int) -> Color:
+	var avatar = _avatars.get(id)
+	if avatar != null and avatar.has_method("limb_color"):
+		return avatar.limb_color()
+	return Color(1.0, 0.9, 0.5)
+
+
+func _hud_node() -> Node:
+	var tree := get_tree()
+	if tree == null:
+		return null
+	return tree.get_first_node_in_group("hud")

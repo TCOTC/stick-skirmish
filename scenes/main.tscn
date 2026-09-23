@@ -1,7 +1,8 @@
-[gd_scene load_steps=5 format=3]
+[gd_scene load_steps=6 format=3]
 
 [ext_resource type="Script" path="res://scripts/arena.gd" id="1_arena"]
 [ext_resource type="Script" path="res://scripts/player.gd" id="2_player"]
+[ext_resource type="Script" path="res://scripts/hud.gd" id="3_hud"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -36,12 +37,15 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
 shape = SubResource("CapsuleShape3D_1")
 
 [node name="SpringArm" type="SpringArm3D" parent="Player"]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 0)
+; 抬高到 2.5：相机更高，角色在画面里就落得更低，准星周围（屏幕中间）能空出来。
+; 1.5 时会看到角色正好挡在准星上。数值由快照里的 headScreenY 核对（0.62 左右合适）。
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.5, 0)
 spring_length = 4.5
 
 [node name="Camera3D" type="Camera3D" parent="Player/SpringArm"]
 
 [node name="HUD" type="CanvasLayer" parent="."]
+script = ExtResource("3_hud")
 
 [node name="Crosshair" type="ColorRect" parent="HUD"]
 anchors_preset = 8
