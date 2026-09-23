@@ -862,6 +862,7 @@ async function checkShoot() {
 
   // 再拍一张“打完之后”的画面：此时右侧还挂着击杀提示（只挂 3.5 秒）。
   if (SHOT_DIR) {
+    fs.mkdirSync(SHOT_DIR, { recursive: true });
     const img = await a.cdp.send("Page.captureScreenshot", { format: "png" });
     const file = path.join(SHOT_DIR, "shoot-after-burst.png");
     fs.writeFileSync(file, Buffer.from(img.data, "base64"));
@@ -1096,6 +1097,7 @@ async function checkScore() {
   // 人眼核对用：此时胜负横幅、最终比分、击杀提示同时在场，是唯一能一起看到的时刻。
   // 击杀提示只挂 3.5 秒，所以必须在这里拍，不能等收尾那一张。
   if (SHOT_DIR && scored) {
+    fs.mkdirSync(SHOT_DIR, { recursive: true });
     const img = await a.cdp.send("Page.captureScreenshot", { format: "png" });
     const file = path.join(SHOT_DIR, "score-round-over.png");
     fs.writeFileSync(file, Buffer.from(img.data, "base64"));
